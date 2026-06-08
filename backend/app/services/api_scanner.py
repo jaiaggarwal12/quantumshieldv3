@@ -1,6 +1,6 @@
 """
 QuantumShield — API & VPN Scanner
-Covers the two gaps from the PNB problem statement:
+Two extra coverage areas beyond web TLS:
   1. API endpoint discovery + TLS scan per endpoint
   2. TLS-based VPN port probe (IKEv2 UDP 500/4500, OpenVPN TCP 443/1194)
 """
@@ -157,6 +157,13 @@ def scan_api_endpoints(base_url: str, timeout: int = 6) -> dict:
     except Exception:
         result["base_tls"] = {}
 
+    # Active PQC key-exchange detection on the base host (raw TLS 1.3 probe).
+    try:
+        from app.services.pqc_detect import detect_key_exchange_group
+        result["pqc_kex_detection"] = detect_key_exchange_group(hostname, port)
+    except Exception as e:
+        result["pqc_kex_detection"] = {"error": str(e)[:100]}
+
     # Probe each API path
     reachable = []
     for path in API_PATHS:
@@ -174,7 +181,8 @@ def scan_api_endpoints(base_url: str, timeout: int = 6) -> dict:
         grades = [e["cipher_grade"] for e in reachable if e["cipher_grade"]]
         worst_grade = sorted(grades, key=lambda g: ["A","B","C","D","F"].index(g) if g in ["A","B","C","D","F"] else 5)[-1] if grades else "?"
         all_fs = all(e["forward_secrecy"] for e in reachable if e["forward_secrecy"] is not None)
-        any_quantum_safe = any(e["quantum_safe"] for e in reachable)
+        pqc_kex = result.get("pqc_kex_detection", {}) or {}
+        any_quantum_safe = any(e["quantum_safe"] for e in reachable) or bool(pqc_kex.get("is_pqc"))
 
         result["api_tls_summary"] = {
             "total_endpoints_discovered": len(API_PATHS),
@@ -184,6 +192,8 @@ def scan_api_endpoints(base_url: str, timeout: int = 6) -> dict:
             "worst_cipher_grade": worst_grade,
             "forward_secrecy_consistent": all_fs,
             "any_pqc_endpoint": any_quantum_safe,
+            "pqc_key_exchange": pqc_kex.get("selected_group"),
+            "pqc_key_exchange_detected": bool(pqc_kex.get("is_pqc")),
         }
 
         # PQC issues for API layer

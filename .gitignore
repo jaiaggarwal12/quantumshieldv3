@@ -3,6 +3,16 @@ __pycache__/
 *.pyc
 .env
 .env.*
+!.env.example
 .vscode/
 dist/
 build/
+
+# Local databases — recreated on startup; never ship these
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc temp
+*.log
+.DS_Store

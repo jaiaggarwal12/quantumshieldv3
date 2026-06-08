@@ -1,5 +1,5 @@
 """
-QuantumShield — Deep Cryptographic Scanner Engine v2.0
+QuantumShield — Deep Cryptographic Scanner Engine
 Covers 40+ security parameters across TLS, certificates, DNS, HTTP, and PQC readiness.
 """
 
@@ -17,6 +17,8 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, dsa, ed25519, ed448
 
+from app.services.pqc_detect import detect_key_exchange_group
+
 # ── NIST PQC Standards ────────────────────────────────────────────────────────
 PQC_ALGORITHMS = {
     "ML-KEM-512":          {"type":"KEM",       "level":1, "standard":"FIPS 203", "safe":True},
@@ -33,6 +35,26 @@ PQC_ALGORITHMS = {
     "SLH-DSA-SHA2-256f":   {"type":"Signature", "level":5, "standard":"FIPS 205", "safe":True},
     "kyber768":            {"type":"KEM",       "level":3, "standard":"Transitional", "safe":True},
     "X25519Kyber768":      {"type":"KEM",       "level":3, "standard":"Hybrid",       "safe":True},
+}
+
+# ── Quantum-Vulnerable Classical Algorithms ──────────────────────────────────
+# Asymmetric primitives broken by Shor's algorithm and symmetric/hash primitives
+# weakened by Grover's algorithm. Used by the /algorithms/pqc endpoint.
+VULNERABLE_ALGORITHMS = {
+    "RSA":     {"type":"Signature/KEM", "broken_by":"Shor",   "safe":False, "replacement":"ML-DSA-65 (FIPS 204) / ML-KEM-768 (FIPS 203)", "note":"Fully broken regardless of key size"},
+    "ECDSA":   {"type":"Signature",     "broken_by":"Shor",   "safe":False, "replacement":"ML-DSA-65 (FIPS 204)",                          "note":"Elliptic curve discrete log broken by Shor"},
+    "ECDH":    {"type":"KEM",           "broken_by":"Shor",   "safe":False, "replacement":"ML-KEM-768 (FIPS 203)",                         "note":"Key exchange broken by Shor"},
+    "ECDHE":   {"type":"KEM",           "broken_by":"Shor",   "safe":False, "replacement":"X25519+ML-KEM-768 (Hybrid, FIPS 203)",          "note":"Ephemeral ECDH still quantum-vulnerable"},
+    "DH":      {"type":"KEM",           "broken_by":"Shor",   "safe":False, "replacement":"ML-KEM-768 (FIPS 203)",                         "note":"Finite-field discrete log broken by Shor"},
+    "DHE":     {"type":"KEM",           "broken_by":"Shor",   "safe":False, "replacement":"ML-KEM-768 (FIPS 203)",                         "note":"Ephemeral DH still quantum-vulnerable"},
+    "DSA":     {"type":"Signature",     "broken_by":"Shor",   "safe":False, "replacement":"ML-DSA-65 (FIPS 204)",                          "note":"NIST-deprecated and quantum-broken"},
+    "Ed25519": {"type":"Signature",     "broken_by":"Shor",   "safe":False, "replacement":"ML-DSA-65 (FIPS 204)",                          "note":"EdDSA discrete log broken by Shor"},
+    "Ed448":   {"type":"Signature",     "broken_by":"Shor",   "safe":False, "replacement":"ML-DSA-87 (FIPS 204)",                          "note":"EdDSA discrete log broken by Shor"},
+    "AES-128": {"type":"Symmetric",     "broken_by":"Grover", "safe":False, "replacement":"AES-256-GCM",                                   "note":"Grover halves effective security to ~64-bit"},
+    "3DES":    {"type":"Symmetric",     "broken_by":"Grover", "safe":False, "replacement":"AES-256-GCM",                                   "note":"SWEET32 (CVE-2016-2183) and weak quantum margin"},
+    "RC4":     {"type":"Symmetric",     "broken_by":"Classical", "safe":False, "replacement":"AES-256-GCM",                                "note":"Classically broken (RFC 7465)"},
+    "SHA-1":   {"type":"Hash",          "broken_by":"Classical", "safe":False, "replacement":"SHA-256 / SHA-384",                          "note":"Collision attacks; deprecated by all CAs"},
+    "MD5":     {"type":"Hash",          "broken_by":"Classical", "safe":False, "replacement":"SHA-256 / SHA-384",                          "note":"Trivially collidable"},
 }
 
 # ── Known Vulnerabilities Database ───────────────────────────────────────────
@@ -196,110 +218,19 @@ def _detect_supported_tls_versions(hostname: str, port: int, timeout: int = 4) -
 
 # ── DNS Deep Analysis ─────────────────────────────────────────────────────────
 def _check_dns_security(hostname: str) -> dict:
-    """Check CAA records, DNSSEC, and basic DNS health."""
-    dns_info = {
-        "caa_records": [],
-        "caa_present": False,
-        "dnssec_enabled": False,
-        "dns_resolves": False,
-        "ipv4_addresses": [],
-        "ipv6_addresses": [],
-        "mx_records": [],
-        "spf_present": False,
-        "dmarc_present": False,
-        "issues": [],
-    }
-    try:
-        # IPv4
-        try:
-            ipv4 = socket.getaddrinfo(hostname, None, socket.AF_INET)
-            dns_info["ipv4_addresses"] = list(set(r[4][0] for r in ipv4))
-            dns_info["dns_resolves"] = True
-        except Exception:
-            pass
-        # IPv6
-        try:
-            ipv6 = socket.getaddrinfo(hostname, None, socket.AF_INET6)
-            dns_info["ipv6_addresses"] = list(set(r[4][0] for r in ipv6))
-        except Exception:
-            pass
-
-        # CAA records via DNS TXT fallback (dig not available everywhere)
-        try:
-            import subprocess
-            caa = subprocess.run(
-                ["nslookup", "-type=CAA", hostname],
-                capture_output=True, text=True, timeout=4
-            )
-            if "issuewild" in caa.stdout.lower() or "issue" in caa.stdout.lower():
-                dns_info["caa_present"] = True
-                for line in caa.stdout.splitlines():
-                    if "issue" in line.lower():
-                        dns_info["caa_records"].append(line.strip())
-        except Exception:
-            pass
-
-        # SPF / DMARC via TXT records
-        try:
-            spf_check = subprocess.run(
-                ["nslookup", "-type=TXT", hostname],
-                capture_output=True, text=True, timeout=4
-            )
-            if "v=spf1" in spf_check.stdout.lower():
-                dns_info["spf_present"] = True
-            dmarc_check = subprocess.run(
-                ["nslookup", "-type=TXT", f"_dmarc.{hostname}"],
-                capture_output=True, text=True, timeout=4
-            )
-            if "v=dmarc1" in dmarc_check.stdout.lower():
-                dns_info["dmarc_present"] = True
-        except Exception:
-            pass
-
-        if not dns_info["caa_present"]:
-            dns_info["issues"].append({
-                "severity": "MEDIUM",
-                "issue": "No CAA DNS records found — any CA can issue certificates for this domain",
-                "action": "Add CAA records to restrict certificate issuance to trusted CAs only"
-            })
-        if not dns_info["ipv6_addresses"]:
-            dns_info["issues"].append({
-                "severity": "INFO",
-                "issue": "No IPv6 (AAAA) records — limited modern network support",
-                "action": "Consider enabling IPv6 for future-readiness"
-            })
-
-    except Exception as e:
-        dns_info["error"] = str(e)
-    return dns_info
+    """Real DNS posture check (CAA, DNSSEC, MX, SPF, DMARC) via dnspython."""
+    from app.services.dns_ocsp import check_dns_security
+    return check_dns_security(hostname)
 
 
-# ── OCSP Check ────────────────────────────────────────────────────────────────
+# ── OCSP Check ───────────────────────────────────────────────────
 def _check_ocsp(cert_details: dict) -> dict:
-    """Check OCSP stapling and revocation status indicators."""
-    ocsp_info = {
-        "ocsp_url": None,
-        "stapling_detected": False,
-        "revocation_check": "not_performed",
-        "issues": []
-    }
-    try:
-        # OCSP URL is embedded in cert (Authority Information Access extension)
-        ocsp_urls = cert_details.get("ocsp_urls", [])
-        if ocsp_urls:
-            ocsp_info["ocsp_url"] = ocsp_urls[0]
-        else:
-            ocsp_info["issues"].append({
-                "severity": "LOW",
-                "issue": "No OCSP URL in certificate — revocation checking may be limited",
-                "action": "Ensure certificate includes OCSP responder URL for revocation checking"
-            })
-    except Exception:
-        pass
-    return ocsp_info
+    """Real OCSP revocation check (RFC 6960) via the responder URL in the cert."""
+    from app.services.dns_ocsp import check_ocsp
+    return check_ocsp(cert_details)
 
 
-# ── HTTP Security Headers Deep Analysis ───────────────────────────────────────
+
 def check_http_security_headers(hostname: str, port: int = 443) -> dict:
     """Deeply analyse all HTTP security headers relevant to crypto and PQC."""
     result = {
@@ -631,6 +562,7 @@ def calculate_pqc_score(scan_result: dict) -> dict:
     sig_algo          = scan_result.get("sig_algo", "")
     forward_secrecy   = scan_result.get("forward_secrecy", True)
     cipher_grade      = scan_result.get("cipher_grade", "A")
+    pqc_kex_detected  = scan_result.get("pqc_kex_detected", False)
 
     # ── TLS Protocol Version ──────────────────────────────────────────────────
     if "1.3" in tls_version:
@@ -686,7 +618,10 @@ def calculate_pqc_score(scan_result: dict) -> dict:
         score += 10                                                  # was +8
 
     # ── Key Exchange ──────────────────────────────────────────────────────────
-    if "ML-KEM" in key_exchange and "Safe" in key_exchange:
+    if pqc_kex_detected:
+        positives.append(f"Post-quantum key exchange verified on the wire: {key_exchange} — defeats Harvest-Now-Decrypt-Later")
+        score += 14                                                  # verified PQC KEX — strongest KEX reward
+    elif "ML-KEM" in key_exchange and "Safe" in key_exchange:
         positives.append(f"ML-KEM quantum-safe key exchange deployed (FIPS 203)")
         score += 10                                                  # was +8
     elif "Hybrid" in key_exchange or "Kyber" in key_exchange:
@@ -794,6 +729,21 @@ def calculate_pqc_score(scan_result: dict) -> dict:
     else:
         status, label, badge_color = "VULNERABLE",      "Quantum Vulnerable",         "#D50000"
 
+    # Full quantum safety requires BOTH a PQC key exchange AND a PQC certificate.
+    # A server with ML-KEM key exchange but a classical (RSA/ECDSA) certificate has
+    # defeated Harvest-Now-Decrypt-Later, but its signature is still quantum-breakable —
+    # so it is "PQC Ready", not "Fully Quantum Safe".
+    cert_is_pqc = ("ML-DSA" in cert_key_type) or ("SLH-DSA" in cert_key_type)
+    if status == "QUANTUM_SAFE" and not cert_is_pqc:
+        status = "PQC_READY"
+        label = "PQC Ready — quantum-safe key exchange, classical certificate"
+        badge_color = "#FFD600"
+        issues.append({
+            "severity": "MEDIUM",
+            "issue": "Certificate still uses a quantum-vulnerable signature despite a post-quantum key exchange — not fully quantum-safe until the certificate migrates",
+            "action": "Obtain an ML-DSA-65 (FIPS 204) certificate to reach full quantum safety",
+        })
+
     return {
         "score": score,
         "status": status,
@@ -845,6 +795,25 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
                 vulnerabilities  = _check_vulnerabilities(tls_version, cipher_name, supported_vers)
                 dns_info         = _check_dns_security(hostname)
                 http_info        = check_http_security_headers(hostname, port)
+                from app.services.dns_ocsp import check_ocsp as _ocsp_check
+                ocsp_info        = _ocsp_check(cert_details, subject_der=cert_der) if cert_der else {}
+
+                # Active PQC key-exchange detection — a raw TLS 1.3 probe reveals the
+                # negotiated named group (incl. ML-KEM/Kyber) that ssl.cipher() hides.
+                try:
+                    pqc_kex = detect_key_exchange_group(hostname, port, timeout=7)
+                except Exception as e:
+                    pqc_kex = {"error": str(e)[:100]}
+
+                pqc_kex_detected = bool(pqc_kex.get("is_pqc"))
+                if pqc_kex_detected:
+                    key_exchange = (
+                        f"{pqc_kex.get('selected_group')} — Hybrid PQC key exchange "
+                        f"({pqc_kex.get('kem')}, {pqc_kex.get('standard')}), actively negotiated"
+                    )
+                elif pqc_kex.get("selected_group") and not pqc_kex.get("error"):
+                    # Confirmed classical TLS 1.3 group on the wire — more precise than the heuristic.
+                    key_exchange = f"{pqc_kex.get('selected_group')} ECDHE (Quantum-Vulnerable — actively detected)"
 
                 tls_info = {
                     "tls_version": tls_version,
@@ -857,6 +826,7 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
                     "supported_tls_versions": supported_vers,
                     "cert_key_type": cert_details.get("key_type", "Unknown"),
                     "cert_key_bits": cert_details.get("key_bits", 0),
+                    "pqc_kex_detection": pqc_kex,
                 }
 
                 cbom = {
@@ -867,7 +837,7 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
                     "components": [
                         {"type":"protocol",     "name":"TLS", "version":tls_version, "supported_versions":supported_vers, "quantum_safe":False},
                         {"type":"cipher-suite", "name":cipher_name, "bits":cipher_bits, "grade":cipher_grade, "forward_secrecy":forward_secrecy, "quantum_safe": any(p in cipher_name for p in PQC_ALGORITHMS)},
-                        {"type":"key-exchange", "name":key_exchange, "quantum_safe":"Safe" in key_exchange or "ML-KEM" in key_exchange},
+                        {"type":"key-exchange", "name":key_exchange, "quantum_safe": pqc_kex_detected or "Safe" in key_exchange or "ML-KEM" in key_exchange, "pqc_detection": pqc_kex},
                         {"type":"certificate",
                          "name":f"{cert_details.get('key_type','?')}-{cert_details.get('key_bits',0)}",
                          "algorithm":cert_details.get("signature_algorithm","?"),
@@ -886,6 +856,7 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
                     "cipher_suite": cipher_name,
                     "cipher_grade": cipher_grade,
                     "key_exchange": key_exchange,
+                    "pqc_kex_detected": pqc_kex_detected,
                     "cert_key_type": cert_details.get("key_type",""),
                     "cert_key_bits": cert_details.get("key_bits",0),
                     "supported_tls_versions": supported_vers,
@@ -905,6 +876,7 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
                     "cbom": cbom,
                     "pqc_assessment": pqc_assessment,
                     "dns": dns_info,
+                    "ocsp": ocsp_info,
                     "http_headers": http_info,
                     "vulnerabilities": vulnerabilities,
                 })
@@ -925,8 +897,8 @@ def scan_tls_target(hostname: str, port: int = 443, timeout: int = 12) -> dict:
         result["status"] = "connection_refused"
         result["errors"].append(f"Connection refused on port {port}")
     except Exception as e:
-        result["errors"].append(f"Scan error: {str(e)}")
-        result = _infer_from_hostname(hostname, port, result)
+        result["status"] = "error"
+        result["errors"].append(f"Scan error (no result fabricated): {str(e)[:200]}")
 
     return result
 
@@ -987,91 +959,70 @@ def _scan_without_verification(hostname, port, timeout, result):
 
 
 def _scan_legacy_target(hostname, port, timeout, result):
-    result = _infer_from_hostname(hostname, port, result)
-    return result
+    """
+    Honest legacy probe. The default handshake failed (likely a weak/legacy
+    cipher modern OpenSSL refused). Retry ONCE with the security level lowered so
+    we can MEASURE the cipher the server actually negotiates — we never guess.
+    If even this fails, report an honest error rather than fabricating results.
+    """
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+        except Exception:
+            pass
+        try:
+            ctx.set_ciphers("ALL:@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
 
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                tls_version = ssock.version()
+                ci = ssock.cipher()
+                cipher_name = ci[0] if ci else "Unknown"
+                cipher_bits = ci[2] if ci else 0
+                cert_der = ssock.getpeercert(binary_form=True)
+                cert_details = get_cert_details(cert_der) if cert_der else {}
 
-def _infer_from_hostname(hostname, port, result):
-    hn = hostname.lower()
-    timestamp = datetime.now(timezone.utc).isoformat()
-    # BUG-6 FIX: rc4-md5 must be checked BEFORE rc4 (substring match order matters)
-    if "rc4-md5" in hn:
-        cipher_name, tls_version = "RC4-MD5", "TLSv1.2"
-        note = "RC4-MD5 cipher — Python SSL refuses this broken cipher; both RC4 biases and MD5 hash weakness present"
-    elif "rc4" in hn:
-        cipher_name, tls_version = "RC4-SHA", "TLSv1.2"
-        note = "RC4 cipher — Python SSL correctly refuses this broken cipher (RFC 7465)"
-    elif "3des" in hn:
-        cipher_name, tls_version = "DES-CBC3-SHA", "TLSv1.2"
-        note = "3DES cipher — SWEET32 vulnerable, Python SSL refuses for security"
-    elif "tls-v1-0" in hn:
-        cipher_name, tls_version = "ECDHE-RSA-AES128-SHA", "TLSv1.0"
-        note = "TLS 1.0 only server — Python 3.10+ refuses deprecated TLS 1.0 (correct)"
-    elif "tls-v1-1" in hn:
-        cipher_name, tls_version = "ECDHE-RSA-AES128-SHA", "TLSv1.1"
-        note = "TLS 1.1 only server — Python 3.10+ refuses deprecated TLS 1.1 (correct)"
-    elif "expired" in hn:
-        cipher_name, tls_version = "ECDHE-RSA-AES128-GCM-SHA256", "TLSv1.2"
-        note = "Expired certificate detected"
-    elif "sha1" in hn:
-        cipher_name, tls_version = "ECDHE-RSA-AES128-SHA", "TLSv1.2"
-        note = "SHA-1 signed certificate — deprecated"
-    elif "null" in hn:
-        cipher_name, tls_version = "NULL-SHA", "TLSv1.2"
-        note = "NULL cipher — no encryption"
-    elif "static-rsa" in hn:
-        # BUG-3 FIX: static-rsa uses RSA key exchange (no ECDHE) — no forward secrecy
-        cipher_name, tls_version = "AES128-GCM-SHA256", "TLSv1.2"
-        note = "Static RSA key exchange — no forward secrecy (Python SSL may refuse)"
-    else:
-        cipher_name, tls_version = "ECDHE-RSA-AES128-GCM-SHA256", "TLSv1.2"
-        note = f"Could not connect to {hostname} — inferred from context"
+        key_exchange    = _detect_key_exchange(cipher_name, tls_version, cert_details)
+        supported_vers  = _detect_supported_tls_versions(hostname, port)
+        forward_secrecy = _has_forward_secrecy(cipher_name)
+        cipher_grade    = _get_cipher_grade(cipher_name)
+        vulnerabilities = _check_vulnerabilities(tls_version, cipher_name, supported_vers)
+        http_info       = check_http_security_headers(hostname, port)
+        dns_info        = _check_dns_security(hostname)
 
-    cert_key_type, cert_key_bits = "RSA", 2048
-    key_exchange = _detect_key_exchange(cipher_name, tls_version, {"key_type": cert_key_type})
-    forward_secrecy = _has_forward_secrecy(cipher_name)
-    cipher_grade = _get_cipher_grade(cipher_name)
-    supported_vers = [tls_version]
-    vulnerabilities = _check_vulnerabilities(tls_version, cipher_name, supported_vers)
+        pqc_assessment = calculate_pqc_score({
+            "tls_version": tls_version, "cipher_suite": cipher_name, "cipher_grade": cipher_grade,
+            "key_exchange": key_exchange, "cert_key_type": cert_details.get("key_type", ""),
+            "cert_key_bits": cert_details.get("key_bits", 0), "supported_tls_versions": supported_vers,
+            "forward_secrecy": forward_secrecy, "days_to_expiry": cert_details.get("days_until_expiry", 999),
+            "has_hsts": http_info.get("hsts", {}).get("present", False),
+            "has_ct": cert_details.get("ct_sct_count", 0) > 0,
+            "is_self_signed": cert_details.get("is_self_signed", False),
+            "sig_algo": cert_details.get("signature_algorithm", ""),
+            "header_score": http_info.get("score", 100),
+        })
 
-    pqc_assessment = calculate_pqc_score({
-        "tls_version": tls_version, "cipher_suite": cipher_name, "cipher_grade": cipher_grade,
-        "key_exchange": key_exchange, "cert_key_type": cert_key_type, "cert_key_bits": cert_key_bits,
-        "supported_tls_versions": supported_vers, "forward_secrecy": forward_secrecy,
-        "days_to_expiry": -1 if "expired" in hn else 365,
-        "has_hsts": False, "has_ct": False, "is_self_signed": False,
-        "sig_algo": "SHA1" if "sha1" in hn else "SHA256", "header_score": 60,
-    })
-
-    result.update({
-        "status": "success_inferred",
-        "tls_info": {
-            "tls_version": tls_version, "cipher_suite": cipher_name,
-            "cipher_bits": 128, "cipher_grade": cipher_grade,
-            "key_exchange": key_exchange, "forward_secrecy": forward_secrecy,
-            "supported_tls_versions": supported_vers,
-            "cert_key_type": cert_key_type, "cert_key_bits": cert_key_bits, "note": note
-        },
-        "certificate": {
-            "key_type": cert_key_type, "key_bits": cert_key_bits,
-            "subject": f"CN={hostname}", "issuer": "badssl.com (inferred)",
-            "not_after": "2025-01-01T00:00:00+00:00", "days_until_expiry": -1 if "expired" in hn else 365,
-            "sans": [hostname], "is_self_signed": False, "pqc_cert": False,
-            "signature_algorithm": "SHA1" if "sha1" in hn else "SHA256",
-            "ct_sct_count": 0, "issues": [], "note": note
-        },
-        "cbom": {
-            "cbom_version": "1.4", "generated_at": timestamp, "target": hostname,
-            "warning": note,
-            "components": [
-                {"type":"protocol","name":"TLS","version":tls_version,"quantum_safe":False},
-                {"type":"cipher-suite","name":cipher_name,"bits":128,"grade":cipher_grade,"quantum_safe":False},
-                {"type":"key-exchange","name":key_exchange,"quantum_safe":False},
-                {"type":"certificate","name":f"{cert_key_type}-{cert_key_bits}","quantum_safe":False},
-            ]
-        },
-        "pqc_assessment": pqc_assessment,
-        "vulnerabilities": vulnerabilities,
-        "dns": {}, "http_headers": {},
-    })
+        result.update({
+            "status": "success_legacy",
+            "tls_info": {
+                "tls_version": tls_version, "cipher_suite": cipher_name, "cipher_bits": cipher_bits,
+                "cipher_grade": cipher_grade, "key_exchange": key_exchange, "forward_secrecy": forward_secrecy,
+                "supported_tls_versions": supported_vers,
+                "cert_key_type": cert_details.get("key_type", "Unknown"),
+                "cert_key_bits": cert_details.get("key_bits", 0),
+                "note": "Measured via a security-level-lowered handshake (server uses a weak/legacy cipher).",
+            },
+            "certificate": cert_details,
+            "pqc_assessment": pqc_assessment,
+            "vulnerabilities": vulnerabilities,
+            "dns": dns_info, "http_headers": http_info,
+        })
+    except Exception as e:
+        result["status"] = "error"
+        result["errors"].append(f"Legacy handshake failed (no result fabricated): {str(e)[:160]}")
     return result

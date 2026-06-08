@@ -5,6 +5,9 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+# Vite inlines env vars at build time, so the backend URL must be a build arg.
+ARG VITE_BACKEND_URL=http://localhost:8000
+ENV VITE_BACKEND_URL=$VITE_BACKEND_URL
 RUN npm run build
 
 FROM nginx:alpine

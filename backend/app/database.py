@@ -1,11 +1,10 @@
 """
 QuantumShield — Database Configuration
-SQLite for hackathon/dev, set DATABASE_URL env var for PostgreSQL in production.
+SQLite for local dev; set DATABASE_URL to a PostgreSQL URL for production.
 """
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./quantumshield.db")
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}

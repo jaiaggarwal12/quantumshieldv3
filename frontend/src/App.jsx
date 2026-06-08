@@ -11,7 +11,7 @@ const T = {
   text2:     "#5A6080",   // secondary text
   text3:     "#9AA0BC",   // muted text
   brand:     "#1B3FAB",   // PNB blue
-  brand2:    "#1530 7D",  // darker brand
+  brand2:    "#15307D",  // darker brand
   accent:    "#2563EB",   // action blue
   accentHov: "#1D4ED8",   // hover
   success:   "#059669",   // green
@@ -29,80 +29,27 @@ const RISK_COLOR = {
 };
 const SEV_COLOR = { CRITICAL:"#DC2626", HIGH:"#EA580C", MEDIUM:"#D97706", LOW:"#059669", INFO:"#2563EB" };
 
-// ── Mock Data ─────────────────────────────────────────────────────────────────
-const buildMock = (target,score,status,tlsVer,cipher,certType,certBits,kex,issues,positives,vulns,daysLeft) => ({
-  target, port:443, status:"success", timestamp:new Date().toISOString(),
-  tls_info:{ tls_version:tlsVer,cipher_suite:cipher,cipher_bits:256,cipher_grade:score>=75?"A":"B",
-             key_exchange:kex,forward_secrecy:true,supported_tls_versions:["TLSv1.3","TLSv1.2"],
-             cert_key_type:certType,cert_key_bits:certBits },
-  certificate:{ key_type:certType,key_bits:certBits,subject:`CN=${target}`,issuer:"CN=Google Trust Services",
-                not_after:new Date(Date.now()+daysLeft*86400000).toISOString(),days_until_expiry:daysLeft,
-                total_validity_days:397,signature_algorithm:"SHA256",sans:[target,`www.${target}`],
-                is_self_signed:false,pqc_cert:false,ct_sct_count:2,key_usage:{digital_signature:true},
-                ocsp_urls:["http://ocsp.example.com"],policies:[],issues:[] },
-  pqc_assessment:{ score,status,label:RISK_COLOR[status]?.badge,badge_color:RISK_COLOR[status]?.border,
-                   issues,positives,parameters_checked:40 },
-  cbom:{ cbom_version:"1.4",components:[
-    {type:"protocol",name:"TLS",version:tlsVer,quantum_safe:false,supported_versions:["TLSv1.3","TLSv1.2"]},
-    {type:"cipher-suite",name:cipher,bits:256,grade:score>=75?"A":"B",forward_secrecy:true,quantum_safe:false},
-    {type:"key-exchange",name:kex,quantum_safe:kex.includes("ML-KEM")},
-    {type:"certificate",name:`${certType}-${certBits}`,algorithm:"SHA256",quantum_safe:false,days_until_expiry:daysLeft,ct_sct_count:2},
-  ]},
-  vulnerabilities:vulns,
-  dns:{ caa_present:true,dnssec_enabled:false,dns_resolves:true,
-        ipv4_addresses:["142.250.80.46"],ipv6_addresses:["2607:f8b0:4004::200e"],
-        issues:score<70?[{severity:"MEDIUM",issue:"No CAA DNS records",action:"Add CAA records"}]:[] },
-  http_headers:{ hsts:{present:true,max_age:31536000,include_subdomains:true,preload:true},
-                 csp:{present:score>60,value:"default-src 'self'"},
-                 headers_found:{"Strict-Transport-Security":"max-age=31536000; includeSubDomains; preload"},
-                 headers_missing:score<70?["X-Frame-Options","Permissions-Policy"]:[],
-                 score:score>70?90:65,issues:[] },
-});
-
-const MOCK_DB = {
-  "google.com":     buildMock("google.com",65,"PQC_READY","TLSv1.3","TLS_AES_256_GCM_SHA384","ECDSA",256,"X25519/P-256 ECDHE (Quantum-Vulnerable)",
-    [{severity:"HIGH",issue:"ECDSA-256 certificate — fully broken by Shor's algorithm",action:"Migrate to ML-DSA-65 (FIPS 204)"},{severity:"MEDIUM",issue:"X25519 ECDHE key exchange — vulnerable to HNDL attacks",action:"Deploy ML-KEM-768 (FIPS 203)"}],
-    ["TLS 1.3 in use","AES-256 symmetric encryption","Forward secrecy enabled"],
-    [{name:"HNDL",cve:"N/A",severity:"CRITICAL",description:"Harvest Now Decrypt Later threat active",action:"Deploy ML-KEM-768"}],48),
-  "cloudflare.com": buildMock("cloudflare.com",72,"PQC_READY","TLSv1.3","TLS_AES_256_GCM_SHA384","ECDSA",256,"X25519+Kyber768 (Hybrid PQC)",
-    [{severity:"HIGH",issue:"ECDSA-256 certificate — quantum-vulnerable signature",action:"Migrate to ML-DSA-65"}],
-    ["TLS 1.3","Hybrid PQC key exchange (X25519+Kyber768)","AES-256-GCM","HSTS with preload"],
-    [{name:"HNDL",cve:"N/A",severity:"HIGH",description:"Certificate still HNDL vulnerable",action:"Complete PQC migration"}],120),
-  "example.com":    buildMock("example.com",32,"VULNERABLE","TLSv1.2","ECDHE-RSA-AES128-GCM-SHA256","RSA",2048,"ECDHE (Quantum-Vulnerable)",
-    [{severity:"CRITICAL",issue:"RSA-2048 — fully broken by Shor's algorithm",action:"Replace with ML-DSA-65"},{severity:"HIGH",issue:"TLS 1.2 in use",action:"Enforce TLS 1.3"}],
-    [],[{name:"HNDL",cve:"N/A",severity:"CRITICAL",description:"Harvest Now Decrypt Later",action:"Full PQC migration required"}],5),
-  "rc4.badssl.com": buildMock("rc4.badssl.com",8,"VULNERABLE","TLSv1.2","RC4-SHA","RSA",2048,"RSA (Quantum-Vulnerable — no forward secrecy)",
-    [{severity:"CRITICAL",issue:"RC4 cipher — broken by classical statistical attacks (RFC 7465)",action:"Disable RC4 immediately"},{severity:"CRITICAL",issue:"No forward secrecy",action:"Migrate to ECDHE or ML-KEM"}],
-    [],[{name:"RC4_BIASES",cve:"CVE-2015-2808",severity:"CRITICAL",description:"RC4 statistical biases allow plaintext recovery",action:"Disable RC4"},{name:"HNDL",cve:"N/A",severity:"CRITICAL",description:"Harvest Now Decrypt Later",action:"Complete overhaul required"}],365),
-  "3des.badssl.com":buildMock("3des.badssl.com",12,"VULNERABLE","TLSv1.2","DES-CBC3-SHA","RSA",2048,"RSA (Quantum-Vulnerable — no forward secrecy)",
-    [{severity:"CRITICAL",issue:"3DES — SWEET32 birthday attack, Grover's ~40-bit quantum security",action:"Disable 3DES immediately"},{severity:"CRITICAL",issue:"No forward secrecy",action:"Switch to ECDHE or ML-KEM"}],
-    [],[{name:"SWEET32",cve:"CVE-2016-2183",severity:"MEDIUM",description:"3DES birthday attack",action:"Disable 3DES"},{name:"HNDL",cve:"N/A",severity:"CRITICAL",description:"Harvest Now Decrypt Later",action:"Full PQC migration"}],365),
-};
-
 // ── Scan Function ─────────────────────────────────────────────────────────────
+// Always hits the real backend. Never fabricates — a failed scan returns an
+// honest error object that the UI surfaces as such.
 async function performScan(target, backendUrl, token) {
   const clean = target.replace(/^https?:\/\//,"").split("/")[0].trim();
-  if (token && backendUrl) {
-    try {
-      const res = await fetch(`${backendUrl}/api/v1/scan/quick`, {
-        method:"POST",
-        headers:{"Content-Type":"application/json","Authorization":`Bearer ${token}`},
-        body: JSON.stringify({target:clean,port:443}),
-        signal: AbortSignal.timeout(25000),
-      });
-      if (res.ok) return await res.json();
-    } catch(_) {}
+  try {
+    const res = await fetch(`${backendUrl}/api/v1/scan/quick`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Authorization":`Bearer ${token}`},
+      body: JSON.stringify({target:clean,port:443}),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (res.ok) return await res.json();
+    let detail = `Scan failed (HTTP ${res.status})`;
+    try { const j = await res.json(); if (j.detail) detail = j.detail; } catch(_){}
+    return { target: clean, port:443, status:"error", error: detail, errors:[detail] };
+  } catch(e) {
+    return { target: clean, port:443, status:"error",
+             error:"Could not reach the backend or the scan timed out.",
+             errors:["network_error"] };
   }
-  // Demo fallback
-  await new Promise(r=>setTimeout(r,1200+Math.random()*800));
-  const mock = MOCK_DB[clean];
-  if (mock) return {...mock, timestamp:new Date().toISOString()};
-  const score = Math.floor(Math.random()*55)+20;
-  const status = score>=65?"PQC_READY":score>=40?"TRANSITIONING":"VULNERABLE";
-  return buildMock(clean,score,status,score>50?"TLSv1.3":"TLSv1.2","ECDHE-RSA-AES256-GCM-SHA384","RSA",2048,"ECDHE (Quantum-Vulnerable)",
-    [{severity:"HIGH",issue:"RSA-2048 certificate — quantum-vulnerable",action:"Migrate to ML-DSA-65 (FIPS 204)"}],
-    score>50?["TLS 1.3 in use"]:[],[{name:"HNDL",cve:"N/A",severity:"CRITICAL",description:"Harvest Now Decrypt Later",action:"Deploy ML-KEM-768"}],
-    Math.floor(Math.random()*300)+30);
 }
 
 // ── Mini UI Components ────────────────────────────────────────────────────────
@@ -149,6 +96,12 @@ function LoginScreen({backendUrl, onLogin}) {
   const [error,   setError]   = useState("");
   const [loading, setLoading] = useState(false);
   const [resent,  setResent]  = useState(false);
+  const [demoInfo, setDemoInfo] = useState(null);
+
+  useEffect(()=>{
+    fetch(`${backendUrl}/api/v1/auth/demo-info`)
+      .then(r=>r.json()).then(d=>{ if(d&&d.enabled) setDemoInfo(d); }).catch(()=>{});
+  },[backendUrl]);
 
   const inp = {
     width:"100%", background:"#FFFFFF", border:"1px solid #DDE1EE",
@@ -156,7 +109,14 @@ function LoginScreen({backendUrl, onLogin}) {
     padding:"11px 14px", outline:"none", boxSizing:"border-box",
   };
 
-  // Step 1: submit username + password → get OTP sent to email
+  // Step 1: submit username + password → OTP sent, OR (demo account) instant login.
+  const _finishLogin = (data) => {
+    const u = {username:data.username, role:data.role, email:data.email, id:data.user_id};
+    localStorage.setItem("qs_token", data.access_token);
+    localStorage.setItem("qs_user", JSON.stringify(u));
+    onLogin(data.access_token, u);
+  };
+
   const doPassword = async () => {
     if(!form.username||!form.password){ setError("Enter your username and password"); return; }
     setLoading(true); setError("");
@@ -164,23 +124,35 @@ function LoginScreen({backendUrl, onLogin}) {
     fd.append("username", form.username); fd.append("password", form.password);
     try {
       const res = await fetch(`${backendUrl}/api/v1/auth/login`,
-        {method:"POST", body:fd, signal:AbortSignal.timeout(10000)});
+        {method:"POST", body:fd, signal:AbortSignal.timeout(15000)});
+      const data = await res.json().catch(()=>({}));
       if(res.ok) {
-        const data = await res.json();
+        // OTP-bypassed accounts (demo) return a token immediately.
+        if(data.otp_required === false && data.access_token){ _finishLogin(data); return; }
         setEmail(data.email || "");
-        if(data.dev_otp) setDevOtp(data.dev_otp); // dev mode: show OTP on screen
         setStep("otp");
       } else {
-        const d = await res.json().catch(()=>({}));
-        setError(d.detail || "Invalid username or password");
+        setError(data.detail || "Invalid username or password");
       }
     } catch(_) {
-      // Offline demo mode — skip OTP
-      const demoUser = {username:form.username, role:"Operator", email:"demo@quantumshield.io", id:0};
-      localStorage.setItem("qs_token","demo");
-      localStorage.setItem("qs_user", JSON.stringify(demoUser));
-      onLogin("demo", demoUser);
+      setError("Cannot reach the server. It may be waking up — try again in a moment.");
     }
+    setLoading(false);
+  };
+
+  // One-click public demo login (no OTP).
+  const quickDemo = async () => {
+    if(!demoInfo) return;
+    setLoading(true); setError("");
+    const fd = new URLSearchParams();
+    fd.append("username", demoInfo.username); fd.append("password", demoInfo.password);
+    try {
+      const res = await fetch(`${backendUrl}/api/v1/auth/login`,
+        {method:"POST", body:fd, signal:AbortSignal.timeout(15000)});
+      const data = await res.json().catch(()=>({}));
+      if(res.ok && data.access_token){ _finishLogin(data); return; }
+      setError(data.detail || "Demo login failed — please try again");
+    } catch(_) { setError("Cannot reach the server. It may be waking up — try again."); }
     setLoading(false);
   };
 
@@ -279,10 +251,38 @@ function LoginScreen({backendUrl, onLogin}) {
               width:"100%",padding:"12px",background:loading?"#93A5D4":"linear-gradient(135deg,#1B3FAB,#2563EB)",
               border:"none",borderRadius:8,color:"#fff",fontSize:14,fontWeight:700,
               cursor:loading?"not-allowed":"pointer",boxShadow:"0 2px 12px #1B3FAB25",fontFamily:"inherit"}}>
-              {loading ? "Sending OTP..." : "Continue →"}
+              {loading ? "Signing in..." : "Continue →"}
             </button>
 
-           
+            {/* Public demo account — instant access, no OTP */}
+            {demoInfo && (
+              <div style={{marginTop:20,paddingTop:18,borderTop:"1px solid #EEF0F8"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                  <div style={{flex:1,height:1,background:"#EEF0F8"}}/>
+                  <span style={{color:"#9CA3AF",fontSize:11,letterSpacing:1}}>TRY THE LIVE DEMO</span>
+                  <div style={{flex:1,height:1,background:"#EEF0F8"}}/>
+                </div>
+                <div style={{background:"#F0F4FF",border:"1px solid #DDE6FF",borderRadius:10,padding:"12px 14px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}>
+                    <span style={{color:"#5A6080"}}>Username</span>
+                    <code style={{color:"#1B3FAB",fontWeight:700}}>{demoInfo.username}</code>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+                    <span style={{color:"#5A6080"}}>Password</span>
+                    <code style={{color:"#1B3FAB",fontWeight:700}}>{demoInfo.password}</code>
+                  </div>
+                </div>
+                <button onClick={quickDemo} disabled={loading} style={{
+                  width:"100%",marginTop:10,padding:"11px",background:"#FFFFFF",
+                  border:"1px solid #1B3FAB",borderRadius:8,color:"#1B3FAB",fontSize:13,fontWeight:700,
+                  cursor:loading?"not-allowed":"pointer",fontFamily:"inherit"}}>
+                  ⚡ Sign in as Demo — no OTP
+                </button>
+                <div style={{color:"#9CA3AF",fontSize:11,textAlign:"center",marginTop:8}}>
+                  Full real functionality · live scans · no email code needed
+                </div>
+              </div>
+            )}
           </>)}
 
           {/* ── STEP 2: Email OTP ── */}
@@ -355,7 +355,7 @@ function LoginScreen({backendUrl, onLogin}) {
         </div>
 
         <div style={{textAlign:"center",marginTop:20,color:"#9CA3AF",fontSize:12}}>
-          PNB Cybersecurity Hackathon 2025-26 · Quantum-Proof Systems
+          QuantumShield · Post-Quantum Cryptography Scanner
         </div>
       </div>
     </div>
@@ -771,7 +771,7 @@ function AIPanel({result, backendUrl, token}) {
 
   const _headers = () => {
     const h = {"Content-Type":"application/json"};
-    if (token && token !== "demo") h["Authorization"] = `Bearer ${token}`;
+    if (token) h["Authorization"] = `Bearer ${token}`;
     return h;
   };
 
@@ -1188,8 +1188,9 @@ function DetailPanel({result, backendUrl, token}) {
             <div style={{color:"#6B7280",fontSize:11,marginTop:3}}>{tls.tls_version||"—"} · Port {result.port} · {tls.cipher_grade?<GradeBadge grade={tls.cipher_grade}/>:""}</div>
             <div style={{marginTop:6,display:"flex",gap:6,flexWrap:"wrap"}}>
               {tls.forward_secrecy&&<span style={{background:"#00e67610",border:"1px solid #00e67640",color:"#059669",padding:"1px 7px",borderRadius:3,fontSize:10}}>FS</span>}
-              {result.status==="success_inferred"&&<span style={{background:"#FFF7ED",border:"1px solid #FED7AA",color:"#EA580C",padding:"1px 7px",borderRadius:3,fontSize:10}}>INFERRED</span>}
+              {result.status==="success_legacy"&&<span style={{background:"#FFF7ED",border:"1px solid #FED7AA",color:"#EA580C",padding:"1px 7px",borderRadius:3,fontSize:10}}>LEGACY CIPHER</span>}
               {result.status==="success_unverified"&&<span style={{background:"#ff525210",border:"1px solid #ff525240",color:"#DC2626",padding:"1px 7px",borderRadius:3,fontSize:10}}>UNVERIFIED CERT</span>}
+              {result.demo&&<span style={{background:"#EFF6FF",border:"1px solid #BFDBFE",color:"#2563EB",padding:"1px 7px",borderRadius:3,fontSize:10}}>DEMO DATA</span>}
             </div>
           </div>
           <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
@@ -1214,19 +1215,33 @@ function DetailPanel({result, backendUrl, token}) {
       <div style={{flex:1,overflowY:"auto",padding:"16px 20px"}}>
         {tab==="overview"&&(
           <div>
-            {/* OQS disclaimer */}
-            <div style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:8,
-              padding:"8px 12px",marginBottom:14,fontSize:11,color:"#1E3A8A",display:"flex",gap:8}}>
-              <span>⚠️</span>
-              <span><b>Note:</b> Python's ssl module cannot detect ML-KEM key exchange (it's in TLS 1.3 extensions). 
-              For definitive PQC key exchange detection, use OQS-OpenSSL or Wireshark. 
-              Certificate algorithm detection (RSA/ECDSA/ML-DSA) is always accurate.</span>
-            </div>
+            {/* Active PQC key-exchange detection banner */}
+            {(() => {
+              const det = tls.pqc_kex_detection || {};
+              const isPqc = det.is_pqc;
+              const ok = det.tls13_supported && !det.error;
+              const bg = isPqc ? "#ECFDF5" : ok ? "#FFF7ED" : "#EFF6FF";
+              const bd = isPqc ? "#A7F3D0" : ok ? "#FED7AA" : "#BFDBFE";
+              const tc = isPqc ? "#065F46" : ok ? "#7C2D12" : "#1E3A8A";
+              return (
+                <div style={{background:bg,border:`1px solid ${bd}`,borderRadius:8,
+                  padding:"8px 12px",marginBottom:14,fontSize:11,color:tc,display:"flex",gap:8}}>
+                  <span>{isPqc ? "🛡️" : ok ? "⚠️" : "ℹ️"}</span>
+                  <span>
+                    <b>Active PQC key-exchange probe:</b>{" "}
+                    {det.summary
+                      ? det.summary
+                      : "QuantumShield runs a raw TLS 1.3 handshake (empty key_share → HelloRetryRequest) to read the negotiated named group directly from the wire — detecting ML-KEM/Kyber that ssl.cipher() cannot see. No OQS/Wireshark needed."}
+                  </span>
+                </div>
+              );
+            })()}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
               {[
                 ["TLS Version",tls.tls_version||"—",tls.tls_version?.includes("1.3")?"#059669":"#D97706"],
                 ["Cipher Suite",tls.cipher_suite||"—","#8c9eff"],
-                ["Key Exchange",tls.key_exchange||"—",tls.key_exchange?.includes("Quantum-Safe")?"#059669":"#EF4444"],
+                ["Key Exchange",tls.key_exchange||"—",(tls.pqc_kex_detection?.is_pqc||tls.key_exchange?.includes("Quantum-Safe")||tls.key_exchange?.includes("Hybrid PQC"))?"#059669":"#EF4444"],
+                ["PQC KEX (detected)",tls.pqc_kex_detection?.selected_group||(tls.pqc_kex_detection?.error?"not detectable":"—"),tls.pqc_kex_detection?.is_pqc?"#059669":"#EF4444"],
                 ["Cert Type",`${cert.key_type||"?"}-${cert.key_bits||0}`,cert.pqc_cert?"#059669":"#EF4444"],
                 ["Forward Secrecy",tls.forward_secrecy?"✓ Enabled":"✗ Disabled",tls.forward_secrecy?"#059669":"#EF4444"],
                 ["Cipher Grade",tls.cipher_grade||"?",{A:"#059669",B:"#16A34A",C:"#D97706",D:"#EF4444",F:"#DC2626"}[tls.cipher_grade]||"#888"],
@@ -1395,7 +1410,7 @@ function APIScanPanel({backendUrl, token}) {
     if(!url.trim()) return;
     setLoading(true); setResult(null); setError(""); setPollMsg("");
     const headers = {"Content-Type":"application/json"};
-    if(token && token!=="demo") headers["Authorization"]=`Bearer ${token}`;
+    if(token) headers["Authorization"]=`Bearer ${token}`;
     try {
       // Step 1: submit job
       const res = await fetch(`${backendUrl}/api/v1/scan/api`, {
@@ -1428,7 +1443,7 @@ function APIScanPanel({backendUrl, token}) {
   const statusColor = {QUANTUM_SAFE:"#059669",PQC_READY:"#16A34A",TRANSITIONING:"#EA580C",VULNERABLE:"#DC2626"};
 
   return (
-    <div style={{padding:"24px 28px",overflowY:"auto",height:"calc(100vh - 56px)"}}>
+    <div style={{padding:"24px 28px",overflowY:"auto",flex:1,minHeight:0}}>
       <div style={{marginBottom:20}}>
         <div style={{color:"#1A1D2E",fontWeight:800,fontSize:18,letterSpacing:2}}>🔌 API ENDPOINT SCANNER</div>
         <div style={{color:"#9CA3AF",fontSize:11,marginTop:3}}>Discovers API endpoints and scans TLS config per endpoint · CERT-In CBOM Annexure-A</div>
@@ -1580,7 +1595,7 @@ function VPNScanPanel({backendUrl, token}) {
     if(!host.trim()) return;
     setLoading(true); setResult(null); setError(""); setPollMsg("");
     const headers = {"Content-Type":"application/json"};
-    if(token && token!=="demo") headers["Authorization"]=`Bearer ${token}`;
+    if(token) headers["Authorization"]=`Bearer ${token}`;
     const hostname = host.trim().replace(/^https?:\/\//,"").split("/")[0];
     try {
       // Step 1: submit job
@@ -1614,7 +1629,7 @@ function VPNScanPanel({backendUrl, token}) {
   const protoColor = {"TCP":"#2563EB","UDP":"#7C3AED"};
 
   return (
-    <div style={{padding:"24px 28px",overflowY:"auto",height:"calc(100vh - 56px)"}}>
+    <div style={{padding:"24px 28px",overflowY:"auto",flex:1,minHeight:0}}>
       <div style={{marginBottom:20}}>
         <div style={{color:"#1A1D2E",fontWeight:800,fontSize:18,letterSpacing:2}}>🛡️ TLS-BASED VPN SCANNER</div>
         <div style={{color:"#9CA3AF",fontSize:11,marginTop:3}}>Probes IKEv2, OpenVPN, SSL-VPN, WireGuard ports · Problem Statement: "TLS-based VPN" discovery</div>
@@ -1809,8 +1824,9 @@ export default function QuantumShield() {
       }
       setAuthReady(true);
     }).catch(() => {
-      // Backend unreachable — if demo token, allow; else clear
-      if(storedToken === "demo" && storedUser) {
+      // Backend unreachable — keep the stored session so a transient blip
+      // (e.g. a cold-starting free-tier backend) doesn't force a re-login.
+      if(storedToken && storedUser) {
         setToken(storedToken); setUser(storedUser);
       } else {
         localStorage.removeItem("qs_token"); localStorage.removeItem("qs_user");
@@ -1836,6 +1852,11 @@ export default function QuantumShield() {
     localStorage.setItem("qs_user",JSON.stringify(u));
   };
   const handleLogout=()=>{
+    // Best-effort server-side token revocation, then clear local session.
+    if(token){
+      fetch(`${backendUrl}/api/v1/auth/logout`,{method:"POST",
+        headers:{"Authorization":`Bearer ${token}`}}).catch(()=>{});
+    }
     localStorage.removeItem("qs_token"); localStorage.removeItem("qs_user");
     setToken(""); setUser(null); setResults([]); setSelected(null); setTermLog([]);
   };
@@ -1844,8 +1865,8 @@ export default function QuantumShield() {
     const list=targets.split("\n").map(t=>t.trim()).filter(Boolean);
     if(!list.length) return;
     setScanning(true);setResults([]);setSelected(null);setTermLog([]);
-    addLog("QuantumShield v3.0 — Deep PQC Scan initiated","#a78bfa");
-    addLog(`Targets: ${list.length} | Parameters per target: 40+ | User: ${user?.username||"demo"}`,"#6666aa");
+    addLog("QuantumShield — Deep PQC Scan initiated","#a78bfa");
+    addLog(`Targets: ${list.length} | Parameters per target: 40+ | User: ${user?.username||"user"}`,"#6666aa");
     addLog("─".repeat(50),"#2a2a4a");
     setProgress({current:0,total:list.length,current_target:""});
     const newResults=[];
@@ -1857,19 +1878,26 @@ export default function QuantumShield() {
       addLog(`  → DNS security analysis (CAA, DNSSEC, SPF, DMARC)`,"#4a4a6a");
       addLog(`  → Vulnerability database cross-reference`,"#4a4a6a");
       addLog(`  → PQC scoring (40 parameters)`,"#4a4a6a");
-      const r=await performScan(t,backendUrl,token==="demo"?null:token);
+      const r=await performScan(t,backendUrl,token);
       newResults.push(r);setResults([...newResults]);
+      if(r.status==="error"||r.status==="blocked"){
+        addLog(`  ✗ ${t} — ${r.status.toUpperCase()}: ${r.error||(r.errors&&r.errors[0])||"scan failed"}`,"#DC2626");
+        addLog(""," ");
+        continue;
+      }
       const score=r.pqc_assessment?.score||0;const status=r.pqc_assessment?.status||"UNKNOWN";
       const scoreColor=score>=75?"#059669":score>=50?"#16A34A":score>=35?"#EA580C":"#DC2626";
-      addLog(`  ✓ ${t} — Score: ${score}/100 [${status}]`,scoreColor);
+      addLog(`  ✓ ${t} — Score: ${score}/100 [${status}]${r.demo?" (DEMO DATA)":""}`,scoreColor);
       const vcount=r.vulnerabilities?.length||0;
       if(vcount>0)addLog(`  ⚠ ${vcount} vulnerability/vulnerabilities detected`,"#EF4444");
       addLog(""," ");
     }
     addLog("─".repeat(50),"#2a2a4a");
-    const avgScore=Math.round(newResults.reduce((a,r)=>a+(r.pqc_assessment?.score||0),0)/newResults.length);
-    addLog(`Scan complete. ${list.length} assets scanned.`,"#a78bfa");
-    addLog(`Avg Score: ${avgScore}/100 | Saved to scan history`,"#c0c0e0");
+    const scored=newResults.filter(r=>r.status!=="error"&&r.status!=="blocked");
+    const avgScore=scored.length?Math.round(scored.reduce((a,r)=>a+(r.pqc_assessment?.score||0),0)/scored.length):0;
+    const failed=newResults.length-scored.length;
+    addLog(`Scan complete. ${scored.length} scanned${failed?`, ${failed} failed/blocked`:""}.`,"#a78bfa");
+    addLog(`Avg Score: ${avgScore}/100`,"#c0c0e0");
     setProgress(p=>({...p,current:list.length,current_target:""}));
     setScanning(false);
     if(newResults.length>0) setSelected(newResults[0]);
@@ -1878,7 +1906,7 @@ export default function QuantumShield() {
   const exportCBOM=()=>{
     const report={
       report_metadata:{title:"QuantumShield CBOM Report",generated_at:new Date().toISOString(),
-        scanner:"QuantumShield v3.0",nist_reference:["FIPS 203","FIPS 204","FIPS 205"],
+        scanner:"QuantumShield",nist_reference:["FIPS 203","FIPS 204","FIPS 205"],
         schema:"CycloneDX 1.4",parameters_checked:40,user:user?.username},
       executive_summary:{
         total_assets:results.length,
@@ -1906,7 +1934,7 @@ export default function QuantumShield() {
     const payload = {
       scan_title: "QuantumShield PQC Security Assessment",
       organization: user?.username ? `Scanned by: ${user.username}` : "QuantumShield Scanner",
-      prepared_by: `QuantumShield v2.0 — ${new Date().toLocaleDateString()}`,
+      prepared_by: `QuantumShield — ${new Date().toLocaleDateString()}`,
       targets: results.map(r => ({
         target: r.target,
         pqc_score: r.pqc_assessment?.score || 0,
@@ -1925,7 +1953,7 @@ export default function QuantumShield() {
     };
     try {
       const headers = {"Content-Type":"application/json"};
-      if(token && token !== "demo") headers["Authorization"] = `Bearer ${token}`;
+      if(token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${backendUrl}/api/v1/reports/pdf`, {
         method:"POST", headers, body: JSON.stringify(payload),
         signal: AbortSignal.timeout(30000)
@@ -1947,7 +1975,7 @@ export default function QuantumShield() {
   const exportCSV = async () => {
     try {
       const headers = {"Content-Type":"application/json"};
-      if(token && token !== "demo") headers["Authorization"] = `Bearer ${token}`;
+      if(token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${backendUrl}/api/v1/export/csv`, {
         method:"POST", headers,
         body: JSON.stringify({results}),
@@ -2004,7 +2032,7 @@ export default function QuantumShield() {
   const exportXML = async () => {
     try {
       const headers = {"Content-Type":"application/json"};
-      if(token && token !== "demo") headers["Authorization"] = `Bearer ${token}`;
+      if(token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${backendUrl}/api/v1/export/xml`, {
         method:"POST", headers,
         body: JSON.stringify({results}),
@@ -2072,9 +2100,9 @@ export default function QuantumShield() {
   ];
 
   return (
-    <div style={{background:"#F7F8FC",minHeight:"100vh",fontFamily:"'Segoe UI',Arial,sans-serif",color:"#1A1D2E",overflow:"hidden"}}>
+    <div style={{background:"#F7F8FC",height:"100vh",fontFamily:"'Segoe UI',Arial,sans-serif",color:"#1A1D2E",overflow:"hidden",display:"flex",flexDirection:"column"}}>
       {/* Header */}
-      <div style={{background:"#FFFFFF",borderBottom:"1px solid #DDE1EE",padding:"0 20px",display:"flex",alignItems:"center",justifyContent:"space-between",height:56,flexShrink:0,boxShadow:"0 1px 20px #7c3aed10"}}>
+      <div style={{background:"#FFFFFF",borderBottom:"1px solid #DDE1EE",padding:"8px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",minHeight:56,flexShrink:0,flexWrap:"wrap",gap:12,boxShadow:"0 1px 20px #7c3aed10",zIndex:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:34,height:34,background:"linear-gradient(135deg,#7c3aed,#1d4ed8)",borderRadius:9,
             display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,
@@ -2082,17 +2110,17 @@ export default function QuantumShield() {
           <div>
             <div style={{color:"#1A1D2E",fontWeight:900,fontSize:17,letterSpacing:3,
               textShadow:"0 0 20px #7c3aed40"}}>QUANTUMSHIELD</div>
-            <div style={{color:"#9CA3AF",fontSize:9,letterSpacing:1}}>PQC SCANNER v3.0 · NIST FIPS 203/204/205 · 40+ PARAMETERS</div>
+            <div style={{color:"#9CA3AF",fontSize:9,letterSpacing:1}}>PQC SCANNER · NIST FIPS 203/204/205 · ACTIVE ML-KEM DETECTION</div>
           </div>
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <div style={{display:"flex",gap:2}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",justifyContent:"flex-end",rowGap:8}}>
+          <div style={{display:"flex",gap:2,flexWrap:"wrap",justifyContent:"flex-end"}}>
             {views.map(v=>(
               <button key={v.id} onClick={()=>setActiveView(v.id)} style={{
                 background:activeView===v.id?"linear-gradient(135deg,#1e1e3a,#16163a)":"none",
                 border:activeView===v.id?"1px solid #B8C0D8":"1px solid transparent",
                 color:activeView===v.id?"#c4b5fd":"#5a5a8a",padding:"5px 13px",borderRadius:6,cursor:"pointer",
-                fontFamily:"inherit",fontSize:11,letterSpacing:0.5,transition:"all 0.2s",
+                fontFamily:"inherit",fontSize:11,letterSpacing:0.5,transition:"all 0.2s",whiteSpace:"nowrap",
                 boxShadow:activeView===v.id?"0 0 12px #7c3aed30":"none"}}>
                 {v.label}
               </button>
@@ -2118,7 +2146,7 @@ export default function QuantumShield() {
               background:backendOk?"#059669":"#D97706",
               boxShadow:`0 0 8px ${backendOk?"#059669":"#D97706"}`}}/>
             <span style={{color:backendOk?"#059669":"#D97706",fontSize:10,fontWeight:700,letterSpacing:1}}>
-              {backendOk?"LIVE":"DEMO"}
+              {backendOk?"LIVE":"OFFLINE"}
             </span>
           </div>
           {/* User chip */}
@@ -2153,7 +2181,7 @@ export default function QuantumShield() {
       )}
 
       {activeView==="history"&&(
-        <div style={{height:"calc(100vh - 56px)",overflowY:"auto"}}>
+        <div style={{flex:1,minHeight:0,overflowY:"auto"}}>
           <HistoryPanel backendUrl={backendUrl} token={token} onLoadScan={(r)=>{
             setSelected(r);setResults([r]);setActiveView("scanner");
           }}/>
@@ -2162,16 +2190,16 @@ export default function QuantumShield() {
 
       {/* User Management View (Admin only) */}
       {activeView==="users"&&user?.role==="Admin"&&(
-        <div style={{height:"calc(100vh - 56px)",overflowY:"auto"}}>
+        <div style={{flex:1,minHeight:0,overflowY:"auto"}}>
           <UserManagement backendUrl={backendUrl} token={token} currentUser={user}/>
         </div>
       )}
 
       {/* Scanner View */}
       {activeView==="scanner"&&(
-        <div style={{display:"grid",gridTemplateColumns:"310px 1fr 460px",height:"calc(100vh - 56px)"}}>
+        <div style={{display:"grid",gridTemplateColumns:"310px 1fr 460px",gridTemplateRows:"minmax(0,1fr)",flex:1,minHeight:0}}>
           {/* Left Panel */}
-          <div style={{borderRight:"1px solid #DDE1EE",display:"flex",flexDirection:"column",background:"#FFFFFF",overflow:"hidden"}}>
+          <div style={{borderRight:"1px solid #DDE1EE",display:"flex",flexDirection:"column",background:"#FFFFFF",overflow:"hidden",minHeight:0}}>
             <div style={{padding:"14px 16px",borderBottom:"1px solid #DDE1EE",flexShrink:0}}>
               <div style={{color:"#9CA3AF",fontSize:10,letterSpacing:2,marginBottom:8}}>SCAN TARGETS</div>
               <textarea value={targets} onChange={e=>setTargets(e.target.value)}
@@ -2248,7 +2276,7 @@ export default function QuantumShield() {
           </div>
 
           {/* Middle Panel */}
-          <div style={{borderRight:"1px solid #DDE1EE",overflowY:"auto",padding:"16px"}}>
+          <div style={{borderRight:"1px solid #DDE1EE",overflowY:"auto",padding:"16px",minHeight:0,minWidth:0}}>
             {results.length>0?(
               <>
                 <SummaryBar results={results}/>
@@ -2282,12 +2310,12 @@ export default function QuantumShield() {
                 </div>
               </>
             ):( 
-              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"80vh"}}>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",minHeight:420}}>
                 <div style={{position:"relative",marginBottom:24}}>
                   <div style={{fontSize:80,lineHeight:1,filter:"drop-shadow(0 0 30px #7c3aed40)"}}>⚛</div>
                   <div style={{position:"absolute",inset:0,background:"radial-gradient(circle,#7c3aed15 0%,transparent 70%)",borderRadius:"50%"}}/>
                 </div>
-                <div style={{fontSize:18,color:"#3a3a7a",letterSpacing:4,fontWeight:800,marginBottom:8}}>QUANTUMSHIELD v3.0</div>
+                <div style={{fontSize:18,color:"#3a3a7a",letterSpacing:4,fontWeight:800,marginBottom:8}}>QUANTUMSHIELD</div>
                 <div style={{fontSize:11,color:"#E5E7EB",letterSpacing:2,marginBottom:4}}>40+ PARAMETERS · NIST FIPS 203/204/205</div>
                 <div style={{fontSize:10,color:"#E5E7EB",marginBottom:28}}>Logged in as <span style={{color:"#6644aa"}}>{user?.username}</span> · {user?.role}</div>
                 <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center",maxWidth:400}}>
@@ -2296,8 +2324,8 @@ export default function QuantumShield() {
                       background:"#F7F8FC",border:"1px solid #DDE1EE",color:"#9CA3AF",
                       padding:"5px 12px",borderRadius:5,cursor:"pointer",fontFamily:"inherit",
                       fontSize:11,transition:"all 0.2s"}}
-                      onMouseOver={e=>{e.target.style.borderColor="#7c3aed";e.target.style.color="#a78bfa";}}
-                      onMouseOut={e=>{e.target.style.borderColor="#2a2a4a";e.target.style.color="#6666aa";}}>
+                      onMouseOver={e=>{e.target.style.borderColor="#7c3aed";e.target.style.color="#7c3aed";}}
+                      onMouseOut={e=>{e.target.style.borderColor="#DDE1EE";e.target.style.color="#9CA3AF";}}>
                       {t}
                     </button>
                   ))}
@@ -2308,13 +2336,14 @@ export default function QuantumShield() {
           </div>
 
           {/* Right Panel */}
-          <div style={{overflowY:"auto"}}><DetailPanel result={selected} backendUrl={backendUrl} token={token}/></div>
+          <div style={{overflowY:"auto",minHeight:0,background:"#FFFFFF"}}><DetailPanel result={selected} backendUrl={backendUrl} token={token}/></div>
         </div>
       )}
 
       {/* Algorithms View */}
       {activeView==="algorithms"&&(
-        <div style={{overflowY:"auto",height:"calc(100vh - 56px)",padding:"24px 32px",maxWidth:960,margin:"0 auto"}}>
+        <div style={{flex:1,minHeight:0,overflowY:"auto",padding:"24px 32px"}}>
+          <div style={{maxWidth:960,margin:"0 auto",width:"100%",boxSizing:"border-box"}}>
           <div style={{color:"#9CA3AF",fontSize:10,letterSpacing:2,marginBottom:20}}>NIST POST-QUANTUM CRYPTOGRAPHY STANDARDS — FINAL (2024)</div>
           <div style={{display:"grid",gap:14,marginBottom:28}}>
             {[
@@ -2361,12 +2390,13 @@ export default function QuantumShield() {
               ))}
             </div>
           </div>
+          </div>
         </div>
       )}
 
       {/* About View */}
       {activeView==="about"&&(
-        <div style={{overflowY:"auto",height:"calc(100vh - 56px)",padding:"32px",background:"#F7F8FC"}}>
+        <div style={{flex:1,minHeight:0,overflowY:"auto",padding:"32px",background:"#F7F8FC"}}>
           <div style={{maxWidth:900,margin:"0 auto"}}>
             {/* Hero */}
             <div style={{textAlign:"center",marginBottom:48,padding:"48px 32px",
@@ -2375,11 +2405,11 @@ export default function QuantumShield() {
               boxShadow:"0 0 60px #7c3aed15"}}>
               <div style={{fontSize:64,marginBottom:16,filter:"drop-shadow(0 0 20px #7c3aed60)"}}>⚛</div>
               <div style={{color:"#1A1D2E",fontWeight:900,fontSize:28,letterSpacing:4,marginBottom:6}}>QUANTUMSHIELD</div>
-              <div style={{color:"#7C3AED",fontWeight:700,fontSize:14,letterSpacing:3,marginBottom:4}}>POST-QUANTUM CRYPTOGRAPHY SCANNER v3.0</div>
-              <div style={{color:"#9CA3AF",fontSize:12,marginBottom:16}}>PNB / PSB Cybersecurity Hackathon 2025-26 · Theme: Quantum-Proof Systems</div>
+              <div style={{color:"#7C3AED",fontWeight:700,fontSize:14,letterSpacing:3,marginBottom:4}}>POST-QUANTUM CRYPTOGRAPHY SCANNER</div>
+              <div style={{color:"#9CA3AF",fontSize:12,marginBottom:16}}>NIST FIPS 203/204/205 · Active ML-KEM key-exchange detection</div>
               <div style={{display:"flex",justifyContent:"center",gap:8,flexWrap:"wrap"}}>
                 {[["FIPS 203","ML-KEM","#60a5fa"],["FIPS 204","ML-DSA","#34d399"],["FIPS 205","SLH-DSA","#a78bfa"],
-                  ["40+ Params","Per Scan","#D97706"],["CycloneDX","v1.4 CBOM","#f472b6"]].map(([s,n,c])=>(
+                  ["Active","KEX Probe","#D97706"],["CycloneDX","v1.4 CBOM","#f472b6"]].map(([s,n,c])=>(
                   <div key={s} style={{background:`${c}18`,border:`1px solid ${c}44`,borderRadius:6,padding:"6px 14px",textAlign:"center"}}>
                     <div style={{color:c,fontWeight:700,fontSize:10,letterSpacing:1}}>{s}</div>
                     <div style={{color:`${c}cc`,fontSize:10,marginTop:1}}>{n}</div>
@@ -2392,12 +2422,14 @@ export default function QuantumShield() {
             <div style={{background:"#FEF2F2",border:"1px solid #ff174430",borderLeft:"4px solid #ff1744",
               borderRadius:10,padding:"16px 20px",marginBottom:32}}>
               <div style={{color:"#DC2626",fontWeight:800,fontSize:14,marginBottom:6}}>
-                🚨 Real-World Finding: No Site Scores Above 72/100
+                🚨 Why this matters
               </div>
               <div style={{color:"#cc8888",fontSize:12,lineHeight:1.7}}>
-                After scanning 75+ sites including Google, Cloudflare, all major Indian banks — <strong style={{color:"#EF4444"}}>nobody is 
-                truly quantum-safe yet.</strong> pnbindia.in scored 50/100 on TLS 1.2 with RSA-2048. 
-                Maximum observed: 72 (Cloudflare with hybrid PQC). This is why QuantumShield exists.
+                Most of the public internet still relies on RSA and ECDSA, which Shor's algorithm
+                breaks on a sufficiently large quantum computer. Even sites that have deployed
+                hybrid ML-KEM key exchange usually still present classical certificates — so
+                <strong style={{color:"#EF4444"}}> almost nothing is fully quantum-safe yet.</strong>{" "}
+                QuantumShield measures exactly where each endpoint stands and what to fix first.
               </div>
             </div>
 
@@ -2457,7 +2489,7 @@ export default function QuantumShield() {
                   </div>
                 ))}
               </div>
-              <div style={{color:"#D1D5DB",fontSize:10}}>Built for the PNB/PSB Cybersecurity Hackathon 2025-26</div>
+              <div style={{color:"#D1D5DB",fontSize:10}}>QuantumShield · Post-Quantum Cryptography Scanner</div>
             </div>
           </div>
         </div>

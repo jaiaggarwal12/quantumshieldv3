@@ -1,24 +1,35 @@
-version: '3.8'
-
 services:
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     environment:
-      - SECRET_KEY=change-this-in-production
-      - ADMIN_PASSWORD=quantum2026
-      - DATABASE_URL=sqlite:///./quantumshield.db
+      # Override these with real secrets via a .env file or your orchestrator's
+      # secret store. Do NOT ship these defaults to production.
+      - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
+      # DB lives under /app/data so the named volume below does not shadow code.
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////app/data/quantumshield.db}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
+      - ALLOW_PRIVATE_TARGETS=${ALLOW_PRIVATE_TARGETS:-false}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-quantum2026}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      - db_data:/app
+      - db_data:/app/data
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost:8000}
     ports:
       - "3000:80"
-    environment:
-      - VITE_BACKEND_URL=http://localhost:8000
     depends_on:
       - backend
     restart: unless-stopped

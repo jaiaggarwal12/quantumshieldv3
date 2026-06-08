@@ -1,11 +1,15 @@
 """
 QuantumShield — AI Chat Router
-Primary: Google Gemini (gemini-2.0-flash — free tier, generous limits)
+Primary: Google Gemini (model set via GEMINI_MODEL, defaults to gemini-2.0-flash)
 Fallback: Rule-based engine (always works, no API needed)
-No Ollama. No OpenAI dependency.
+
+Robustness: the free Gemini tier frequently returns 503 ("high demand") and the
+2.5 "thinking" models can spend the whole output budget on reasoning and return
+empty text. So we retry transient errors with backoff and fall back across a
+chain of models before giving up to the rule-based engine.
 """
-import json, os, urllib.request, urllib.error
-from typing import Optional, List
+import json, os, time, urllib.request, urllib.error
+from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from app.models.user import User
@@ -15,7 +19,14 @@ router = APIRouter(prefix="/api/v1/ai", tags=["AI"])
 
 GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_URL   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Try the configured model first, then known-reliable free-tier fallbacks.
+_FALLBACKS = ["gemini-2.0-flash", "gemini-flash-latest", "gemini-2.5-flash"]
+MODEL_CHAIN = [GEMINI_MODEL] + [m for m in _FALLBACKS if m != GEMINI_MODEL]
+
+
+def _gemini_url(model: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -57,11 +68,14 @@ class ExplainRequest(BaseModel):
 def _system_prompt(ctx: dict = None) -> str:
     base = (
         "You are QuantumShield AI — a post-quantum cryptography expert assistant "
-        "built into a security scanner used by Indian banks. You understand NIST FIPS 203 "
+        "built into a security scanner used by banks and enterprises. You understand NIST FIPS 203 "
         "(ML-KEM), FIPS 204 (ML-DSA), FIPS 205 (SLH-DSA). RSA and ECDSA are broken by "
         "Shor's Algorithm on quantum computers. HNDL = Harvest Now Decrypt Later — "
         "adversaries record encrypted traffic today to decrypt when quantum computers arrive. "
-        "Python's ssl module cannot detect ML-KEM key exchange (it's in TLS 1.3 extensions). "
+        "QuantumShield actively detects ML-KEM key exchange by performing a raw TLS 1.3 handshake "
+        "probe (an empty key_share that forces a HelloRetryRequest), reading the server's selected "
+        "named group directly from the wire — so it CAN see ML-KEM/Kyber hybrids (e.g. X25519MLKEM768) "
+        "that Python's ssl.cipher() hides in TLS 1.3 extensions. "
         "Be concise, technically accurate, and give exact algorithm names and FIPS numbers. "
         "Keep responses under 200 words unless asked for a detailed report."
     )
@@ -81,72 +95,78 @@ def _system_prompt(ctx: dict = None) -> str:
 
 
 # ── Gemini API call ───────────────────────────────────────────────────────────
-def _gemini(messages: list, system: str) -> Optional[str]:
-    """
-    Call Google Gemini API.
-    Gemini uses 'contents' array with 'parts' — different from OpenAI format.
-    System prompt is passed as the first user turn with model ack.
-    """
-    if not GEMINI_KEY:
-        return None
-
-    # Build Gemini contents array
-    # Gemini doesn't have a system role — prepend system as first user message
-    contents = []
-
-    # System context as first user message + model acknowledgement
-    contents.append({
-        "role": "user",
-        "parts": [{"text": system + "\n\nAcknowledge that you understand your role and are ready to help."}]
-    })
-    contents.append({
-        "role": "model",
-        "parts": [{"text": "Understood. I am QuantumShield AI, ready to provide expert post-quantum cryptography guidance based on the scan context provided."}]
-    })
-
-    # Add conversation messages — map "assistant" to "model" for Gemini
+def _build_contents(messages: list, system: str) -> list:
+    """Gemini has no system role — prepend system as a user turn + model ack."""
+    contents = [
+        {"role": "user", "parts": [{"text": system + "\n\nAcknowledge that you understand your role and are ready to help."}]},
+        {"role": "model", "parts": [{"text": "Understood. I am QuantumShield AI, ready to provide expert post-quantum cryptography guidance based on the scan context provided."}]},
+    ]
     for m in messages:
         role = "model" if m["role"] == "assistant" else "user"
         contents.append({"role": role, "parts": [{"text": m["content"]}]})
+    return contents
+
+
+def _call_model(model: str, contents: list, retries: int = 2) -> Optional[str]:
+    """Call one model with retries on transient (503/429) errors. Returns text or None."""
+    gen_cfg = {"temperature": 0.7, "maxOutputTokens": 800, "topP": 0.95}
+    # 2.5 models "think" and can consume the whole output budget -> empty text.
+    # Disable thinking so the budget is spent on the actual answer.
+    if "2.5" in model or "gemini-3" in model:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
 
     payload = json.dumps({
         "contents": contents,
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 600,
-            "topP": 0.95,
-        },
+        "generationConfig": gen_cfg,
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
+        ],
     }).encode("utf-8")
 
-    url = f"{GEMINI_URL}?key={GEMINI_KEY}"
-    try:
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=25) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            # Extract text from response
+    url = f"{_gemini_url(model)}?key={GEMINI_KEY}"
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=payload,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = json.loads(r.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "").strip()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        # Log but don't crash — fall through to rule-based
-        print(f"Gemini HTTP error {e.code}: {body[:200]}")
-    except Exception as e:
-        print(f"Gemini error: {e}")
-
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return text
+                # Empty text (e.g. MAX_TOKENS on a thinking model) — try next model.
+            return None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            if e.code in (503, 429, 500) and attempt < retries:
+                time.sleep(0.8 * (attempt + 1))   # brief backoff, then retry
+                continue
+            print(f"Gemini HTTP error {e.code} on {model}: {body[:160]}")
+            return None
+        except Exception as e:
+            print(f"Gemini error on {model}: {e}")
+            return None
     return None
+
+
+def _gemini(messages: list, system: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Try each model in the chain (with retries) until one returns text.
+    Returns (text, model_used) or (None, None).
+    """
+    if not GEMINI_KEY:
+        return None, None
+    contents = _build_contents(messages, system)
+    for model in MODEL_CHAIN:
+        text = _call_model(model, contents)
+        if text:
+            return text, model
+    return None, None
 
 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
@@ -193,10 +213,12 @@ def _rule(msg: str, ctx: dict) -> str:
         )
     if any(w in m for w in ["oqs", "detect", "python ssl", "ml-kem detect", "quantum safe"]):
         return (
-            "Python's ssl module cannot detect ML-KEM key exchange — it's negotiated in "
-            "TLS 1.3 ClientHello extensions, not visible in the cipher suite string. "
-            "QuantumShield detects it via cipher name pattern matching (works for Cloudflare "
-            "X25519+Kyber768). For definitive detection: use OQS-OpenSSL or Wireshark."
+            "QuantumShield actively detects ML-KEM key exchange with a raw TLS 1.3 handshake "
+            "probe: it sends a ClientHello advertising the PQC hybrid groups with an empty "
+            "key_share, which forces the server to reveal its chosen group in a HelloRetryRequest. "
+            "That means it reads the negotiated named group (e.g. X25519MLKEM768, FIPS 203) "
+            "straight from the wire — something Python's ssl.cipher() cannot expose because the "
+            "group lives in TLS 1.3 extensions. No OQS-OpenSSL or Wireshark required."
         )
     if any(w in m for w in ["rsa", "ecdsa", "certificate", "cert"]):
         return (
@@ -288,15 +310,11 @@ async def chat(req: ChatRequest, _: Optional[User] = Depends(get_current_user)):
     system = _system_prompt(ctx)
     msgs = [{"role": m.role, "content": m.content} for m in req.messages]
 
-    resp = _gemini(msgs, system)
-    src  = "gemini"
-
-    if not resp:
-        last = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
-        resp = _rule(last, ctx)
-        src  = "rule-based"
-
-    return {"response": resp, "source": src, "model": GEMINI_MODEL if src == "gemini" else None}
+    resp, model_used = _gemini(msgs, system)
+    if resp:
+        return {"response": resp, "source": "gemini", "model": model_used}
+    last = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
+    return {"response": _rule(last, ctx), "source": "rule-based", "model": None}
 
 
 @router.post("/explain")
@@ -332,47 +350,30 @@ async def explain(req: ExplainRequest, _: Optional[User] = Depends(get_current_u
     system = _system_prompt()
     msgs   = [{"role": "user", "content": prompt}]
 
-    resp = _gemini(msgs, system)
-    src  = "gemini"
-
-    if not resp:
-        resp = _rule_explain(req)
-        src  = "rule-based"
-
-    return {"explanation": resp, "source": src, "model": GEMINI_MODEL if src == "gemini" else None}
+    resp, model_used = _gemini(msgs, system)
+    if resp:
+        return {"explanation": resp, "source": "gemini", "model": model_used}
+    return {"explanation": _rule_explain(req), "source": "rule-based", "model": None}
 
 
 @router.get("/status")
 async def ai_status():
-    """Check which AI backend is live."""
-    gemini_ok = False
+    """Check which AI backend is live by trying the model chain once."""
+    active_model = None
     if GEMINI_KEY:
-        try:
-            # Quick test call with minimal tokens
-            test_payload = json.dumps({
-                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-                "generationConfig": {"maxOutputTokens": 5}
-            }).encode()
-            req = urllib.request.Request(
-                f"{GEMINI_URL}?key={GEMINI_KEY}",
-                data=test_payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=5) as r:
-                gemini_ok = r.status == 200
-        except Exception:
-            pass
+        contents = [{"role": "user", "parts": [{"text": "ping"}]}]
+        for model in MODEL_CHAIN:
+            if _call_model(model, contents, retries=0):
+                active_model = model
+                break
 
     return {
         "gemini": {
-            "available": gemini_ok,
-            "model": GEMINI_MODEL,
-            "key_configured": bool(GEMINI_KEY)
+            "available": active_model is not None,
+            "model": active_model or GEMINI_MODEL,
+            "model_chain": MODEL_CHAIN,
+            "key_configured": bool(GEMINI_KEY),
         },
-        "fallback": {
-            "available": True,
-            "type": "rule-based (always works)"
-        },
-        "active": "gemini" if gemini_ok else "rule-based"
+        "fallback": {"available": True, "type": "rule-based (always works)"},
+        "active": "gemini" if active_model else "rule-based",
     }

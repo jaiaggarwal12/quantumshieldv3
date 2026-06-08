@@ -1,10 +1,9 @@
 """
 QuantumShield — API Scanner & VPN Probe Router
-Fixes:
-  - 401 error: auth is now OPTIONAL (scans work without login, but login saves history)
-  - Timeout: async background jobs with polling so Vercel 30s limit isn't hit
-  - CSV, XML export
-  - CERT-In CBOM mapping
+
+  - SSRF-guarded targets
+  - Database-backed async jobs (poll-friendly, survive restarts/workers)
+  - CSV / XML (CERT-In CBOM) export
 """
 
 import asyncio
@@ -16,20 +15,23 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.core.logging_config import get_logger
+from app.core.net_guard import validate_target
+from app.database import get_db, SessionLocal
+from app.models.scan_job import ScanJob
 from app.models.user import User
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, require_auth, _client_ip
+from app.services import audit_service as audit
 from app.services.api_scanner import scan_api_endpoints, scan_vpn_endpoints
 
+logger = get_logger("quantumshield.api_scanner")
 router = APIRouter(prefix="/api/v1", tags=["API Scanner", "VPN", "Export"])
 
-# In-memory job store for background scans
-_jobs: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
@@ -46,108 +48,111 @@ class CSVExportRequest(BaseModel):
     results: list
 
 
-# ── Background job helpers ────────────────────────────────────────────────────
-def _run_api_scan_bg(job_id: str, base_url: str):
-    try:
-        _jobs[job_id]["status"] = "running"
-        result = scan_api_endpoints(base_url, timeout=6)
-        _jobs[job_id].update({"status": "done", "result": result})
-    except Exception as e:
-        _jobs[job_id].update({"status": "error", "error": str(e)})
+# ── Job persistence helpers ───────────────────────────────────────────────────
+def _create_job(db: Session, job_type: str, target: str, user_id: Optional[int]) -> str:
+    job_id = str(uuid.uuid4())
+    job = ScanJob(job_id=job_id, user_id=user_id, job_type=job_type, target=target, status="queued")
+    db.add(job)
+    db.commit()
+    return job_id
 
 
-def _run_vpn_scan_bg(job_id: str, hostname: str, timeout: float):
+def _run_scan_bg(job_id: str, kind: str, target: str, timeout: float):
+    db = SessionLocal()
     try:
-        _jobs[job_id]["status"] = "running"
-        result = scan_vpn_endpoints(hostname, timeout=timeout)
-        _jobs[job_id].update({"status": "done", "result": result})
+        job = db.query(ScanJob).filter(ScanJob.job_id == job_id).first()
+        if not job:
+            return
+        job.status = "running"
+        db.commit()
+        if kind == "api":
+            result = scan_api_endpoints(target, timeout=6)
+        else:
+            result = scan_vpn_endpoints(target, timeout=timeout)
+        job.set_result(result)
+        job.status = "done"
+        db.commit()
     except Exception as e:
-        _jobs[job_id].update({"status": "error", "error": str(e)})
+        logger.exception("%s scan job %s failed", kind, job_id)
+        try:
+            job = db.query(ScanJob).filter(ScanJob.job_id == job_id).first()
+            if job:
+                job.status = "error"
+                job.error = str(e)[:300]
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
 
 
 # ── API Scanner ────────────────────────────────────────────────────────────────
 @router.post("/scan/api")
-async def scan_api(
-    request: APIScanRequest,
-    background_tasks: BackgroundTasks,
-    current_user: Optional[User] = Depends(get_current_user)
-):
-    """
-    Start an async API endpoint scan. Returns a job_id immediately.
-    Poll GET /scan/api/job/{job_id} for results.
-    Auth is optional — logged-in users get scan saved to history.
-    """
-    if not request.base_url.strip():
+async def scan_api(request: APIScanRequest, req: Request,
+                   current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    """Start an async API endpoint scan. Poll GET /scan/api/job/{job_id}."""
+    base = request.base_url.strip()
+    if not base:
         raise HTTPException(status_code=400, detail="base_url is required")
+    host = base.replace("https://", "").replace("http://", "").split("/")[0].strip()
+    ok, reason = validate_target(host, request.port)
+    if not ok:
+        audit.record(db, "scan.api.blocked", user_id=current_user.id, username=current_user.username,
+                     ip=_client_ip(req), target=host, status="blocked", detail={"reason": reason})
+        raise HTTPException(status_code=400, detail=reason)
 
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "type": "api",
-        "target": request.base_url,
-        "status": "queued",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "result": None,
-        "error": None,
-    }
-    # Run in thread pool so it doesn't block the event loop
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_api_scan_bg, job_id, request.base_url)
-
-    return {"job_id": job_id, "status": "queued", "message": "Scan started — poll /scan/api/job/{job_id} for results"}
+    job_id = _create_job(db, "api", base, current_user.id)
+    audit.record(db, "scan.api", user_id=current_user.id, username=current_user.username,
+                 ip=_client_ip(req), target=host, detail={"job_id": job_id})
+    asyncio.get_event_loop().run_in_executor(_executor, _run_scan_bg, job_id, "api", base, 6.0)
+    return {"job_id": job_id, "status": "queued", "message": "Scan started — poll /scan/api/job/{job_id}"}
 
 
 @router.get("/scan/api/job/{job_id}")
-async def get_api_scan_job(job_id: str):
-    """Poll this endpoint for API scan results."""
-    if job_id not in _jobs:
+async def get_api_scan_job(job_id: str, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    job = db.query(ScanJob).filter(ScanJob.job_id == job_id).first()
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _jobs[job_id]
+    if job.user_id not in (None, current_user.id) and current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+    return job.to_dict()
 
 
 # ── VPN Probe ─────────────────────────────────────────────────────────────────
 @router.post("/scan/vpn")
-async def scan_vpn(
-    request: VPNScanRequest,
-    current_user: Optional[User] = Depends(get_current_user)
-):
-    """
-    Start an async VPN port probe. Returns a job_id immediately.
-    Poll GET /scan/vpn/job/{job_id} for results.
-    Auth is optional.
-    """
+async def scan_vpn(request: VPNScanRequest, req: Request,
+                   current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    """Start an async VPN port probe. Poll GET /scan/vpn/job/{job_id}."""
     hostname = request.hostname.replace("https://", "").replace("http://", "").split("/")[0].strip()
     if not hostname:
         raise HTTPException(status_code=400, detail="hostname is required")
+    ok, reason = validate_target(hostname, 443)
+    if not ok:
+        audit.record(db, "scan.vpn.blocked", user_id=current_user.id, username=current_user.username,
+                     ip=_client_ip(req), target=hostname, status="blocked", detail={"reason": reason})
+        raise HTTPException(status_code=400, detail=reason)
 
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "type": "vpn",
-        "target": hostname,
-        "status": "queued",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "result": None,
-        "error": None,
-    }
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run_vpn_scan_bg, job_id, hostname, request.timeout)
-
-    return {"job_id": job_id, "status": "queued", "message": "VPN probe started — poll /scan/vpn/job/{job_id} for results"}
+    job_id = _create_job(db, "vpn", hostname, current_user.id)
+    audit.record(db, "scan.vpn", user_id=current_user.id, username=current_user.username,
+                 ip=_client_ip(req), target=hostname, detail={"job_id": job_id})
+    asyncio.get_event_loop().run_in_executor(_executor, _run_scan_bg, job_id, "vpn", hostname, request.timeout)
+    return {"job_id": job_id, "status": "queued", "message": "VPN probe started — poll /scan/vpn/job/{job_id}"}
 
 
 @router.get("/scan/vpn/job/{job_id}")
-async def get_vpn_scan_job(job_id: str):
-    """Poll this endpoint for VPN scan results."""
-    if job_id not in _jobs:
+async def get_vpn_scan_job(job_id: str, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    job = db.query(ScanJob).filter(ScanJob.job_id == job_id).first()
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _jobs[job_id]
+    if job.user_id not in (None, current_user.id) and current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+    return job.to_dict()
 
 
-# ── CSV Export (no auth required — export your own data) ─────────────────────
+# ── CSV Export ───────────────────────────────────────────────────────────────
 @router.post("/export/csv")
-async def export_csv(request: CSVExportRequest):
-    """Export scan results as CSV. No auth required."""
+async def export_csv(request: CSVExportRequest, current_user: User = Depends(require_auth)):
+    """Export scan results as CSV."""
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -185,8 +190,8 @@ async def export_csv(request: CSVExportRequest):
 
 # ── XML Export ────────────────────────────────────────────────────────────────
 @router.post("/export/xml")
-async def export_xml(request: CSVExportRequest):
-    """Export scan results as CERT-In compliant XML. No auth required."""
+async def export_xml(request: CSVExportRequest, current_user: User = Depends(require_auth)):
+    """Export scan results as CERT-In compliant XML."""
     ts  = datetime.now(timezone.utc).isoformat()
     esc = lambda s: str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
     lines = [

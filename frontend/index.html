@@ -8,11 +8,15 @@
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      body { overflow: hidden; }
-      ::-webkit-scrollbar { width: 6px; height: 6px; }
-      ::-webkit-scrollbar-track { background: #06060f; }
-      ::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 3px; }
-      ::-webkit-scrollbar-thumb:hover { background: #4a4a7a; }
+      html, body, #root { height: 100%; }
+      body { overflow: hidden; background: #F7F8FC; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+      * { scrollbar-width: thin; scrollbar-color: #C8CDE0 transparent; }
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: #C8CDE0; border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: #9AA0BC; }
+      button { font-family: inherit; }
+      ::selection { background: #7c3aed33; }
     </style>
   </head>
   <body>

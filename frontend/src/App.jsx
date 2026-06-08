@@ -1836,10 +1836,23 @@ export default function QuantumShield() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
-  // Check backend health
+  // Check backend health — keeps polling so the LIVE/OFFLINE badge self-heals.
+  // Render's free tier sleeps and can take ~50s to wake, so we poll quickly while
+  // it's down (cold start) and slow down once it's up.
   useEffect(()=>{
-    fetch(`${backendUrl}/api/v1/health`,{signal:AbortSignal.timeout(3000)})
-      .then(r=>r.ok&&setBackendOk(true)).catch(()=>setBackendOk(false));
+    let cancelled=false; let timer;
+    const check=async()=>{
+      let ok=false;
+      try{
+        const r=await fetch(`${backendUrl}/api/v1/health`,{signal:AbortSignal.timeout(8000)});
+        ok=r.ok;
+      }catch(_){ ok=false; }
+      if(cancelled) return;
+      setBackendOk(ok);
+      timer=setTimeout(check, ok?20000:4000);
+    };
+    check();
+    return ()=>{cancelled=true; clearTimeout(timer);};
   },[backendUrl]);
 
   useEffect(()=>{if(termRef.current)termRef.current.scrollTop=termRef.current.scrollHeight;},[termLog]);

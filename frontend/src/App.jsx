@@ -54,17 +54,21 @@ async function performScan(target, backendUrl, token) {
 
 // ── Mini UI Components ────────────────────────────────────────────────────────
 function ScoreRing({score,size=72}) {
-  const r=size/2-7; const circ=2*Math.PI*r; const dash=(score/100)*circ;
-  const color=score>=75?"#059669":score>=55?"#16A34A":score>=35?"#EA580C":"#DC2626";
+  const strokeWidth = size > 60 ? 6 : size > 40 ? 4 : 3;
+  const r = size/2 - strokeWidth/2 - 1.5;
+  const circ = 2 * Math.PI * r;
+  const dash = (score / 100) * circ;
+  const color = score >= 75 ? "#059669" : score >= 55 ? "#16A34A" : score >= 35 ? "#EA580C" : "#DC2626";
   return (
-    <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1a1a2e" strokeWidth="7"/>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="7"
+    <svg width={size} height={size} style={{ display: "block" }}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#E2E8F0" strokeWidth={strokeWidth}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={strokeWidth}
         strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
-        style={{transition:"stroke-dasharray 1.2s ease",filter:`drop-shadow(0 0 5px ${color})`}}/>
-      <text x={size/2} y={size/2} textAnchor="middle" dominantBaseline="middle"
-        fill={color} fontSize={size>60?15:11} fontWeight="800"
-        style={{transform:`rotate(90deg)`,transformOrigin:`${size/2}px ${size/2}px`,fontFamily:"inherit"}}>{score}</text>
+        transform={`rotate(-90 ${size/2} ${size/2})`}
+        style={{transition:"stroke-dasharray 1.2s ease"}}/>
+      <text x={size/2} y={size/2} textAnchor="middle" dominantBaseline="central"
+        fill={color} fontSize={size > 60 ? 15 : size > 40 ? 12 : 9.5} fontWeight="800"
+        style={{fontFamily:"inherit"}}>{score}</text>
     </svg>
   );
 }
@@ -87,7 +91,7 @@ function GradeBadge({grade}) {
 }
 
 // ── Login Screen ──────────────────────────────────────────────────────────────
-function LoginScreen({backendUrl, onLogin}) {
+function LoginScreen({backendUrl, onBackendUrlChange, onLogin}) {
   const [step,    setStep]    = useState("password"); // "password" | "otp"
   const [form,    setForm]    = useState({username:"", password:""});
   const [otp,     setOtp]     = useState("");
@@ -96,12 +100,51 @@ function LoginScreen({backendUrl, onLogin}) {
   const [error,   setError]   = useState("");
   const [loading, setLoading] = useState(false);
   const [resent,  setResent]  = useState(false);
-  const [demoInfo, setDemoInfo] = useState(null);
+  const [demoInfo, setDemoInfo] = useState(() => {
+    try {
+      const cached = localStorage.getItem("qs_demo_info");
+      return cached ? JSON.parse(cached) : null;
+    } catch (_) {
+      return null;
+    }
+  });
 
-  useEffect(()=>{
-    fetch(`${backendUrl}/api/v1/auth/demo-info`)
-      .then(r=>r.json()).then(d=>{ if(d&&d.enabled) setDemoInfo(d); }).catch(()=>{});
-  },[backendUrl]);
+  useEffect(() => {
+    let active = true;
+    let retries = 0;
+    const maxRetries = 15; // 15 retries * 3s = 45s (covers Render spin-up time)
+
+    const fetchDemoInfo = () => {
+      if (!active) return;
+      fetch(`${backendUrl}/api/v1/auth/demo-info`)
+        .then(res => {
+          if (!res.ok) throw new Error("Server error");
+          return res.json();
+        })
+        .then(data => {
+          if (active) {
+            if (data && data.enabled) {
+              setDemoInfo(data);
+              localStorage.setItem("qs_demo_info", JSON.stringify(data));
+            } else {
+              setDemoInfo(null);
+              localStorage.removeItem("qs_demo_info");
+            }
+          }
+        })
+        .catch(() => {
+          if (active && retries < maxRetries) {
+            retries++;
+            setTimeout(fetchDemoInfo, 3000);
+          }
+        });
+    };
+
+    fetchDemoInfo();
+    return () => {
+      active = false;
+    };
+  }, [backendUrl]);
 
   const inp = {
     width:"100%", background:"#FFFFFF", border:"1px solid #DDE1EE",
@@ -352,6 +395,7 @@ function LoginScreen({backendUrl, onLogin}) {
               </button>
             </div>
           </>)}
+
         </div>
 
         <div style={{textAlign:"center",marginTop:20,color:"#9CA3AF",fontSize:12}}>
@@ -612,15 +656,15 @@ function VulnPanel({vulns}) {
   if(!vulns?.length) return <div style={{color:"#3a5a3a",fontSize:13,padding:"20px 0"}}>✓ No known classical vulnerabilities detected</div>;
   return <div style={{display:"flex",flexDirection:"column",gap:8}}>
     {vulns.map((v,i)=>(
-      <div key={i} style={{background:"#120000",border:`1px solid ${SEV_COLOR[v.severity]||"#333"}30`,
+      <div key={i} style={{background:"#FEF2F2",border:`1px solid ${SEV_COLOR[v.severity]||"#333"}30`,
         borderLeft:`3px solid ${SEV_COLOR[v.severity]||"#333"}`,borderRadius:6,padding:"10px 14px"}}>
         <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
           <SevBadge sev={v.severity}/>
           <span style={{color:"#7F1D1D",fontWeight:700,fontSize:13,fontFamily:"inherit"}}>{v.name}</span>
-          {v.cve!=="N/A"&&<span style={{color:"#9CA3AF",fontSize:11,fontFamily:"inherit"}}>{v.cve}</span>}
+          {v.cve!=="N/A"&&<span style={{color:"#6B7280",fontSize:11,fontFamily:"inherit"}}>{v.cve}</span>}
         </div>
-        <div style={{color:"#cc9999",fontSize:12,marginBottom:4}}>{v.description}</div>
-        <div style={{color:"#888",fontSize:11}}>→ {v.action}</div>
+        <div style={{color:"#374151",fontSize:12,marginBottom:4}}>{v.description}</div>
+        <div style={{color:"#4B5563",fontSize:11}}>→ {v.action}</div>
       </div>
     ))}
   </div>;
@@ -674,10 +718,10 @@ function DNSPanel({dns}) {
       </div>
     ))}
     {dns.issues?.map((issue,i)=>(
-      <div key={i} style={{background:"#1a1200",border:`1px solid ${SEV_COLOR[issue.severity]||"#333"}30`,
+      <div key={i} style={{background:"#FFFBEB",border:`1px solid ${SEV_COLOR[issue.severity]||"#333"}30`,
         borderLeft:`3px solid ${SEV_COLOR[issue.severity]||"#333"}`,borderRadius:6,padding:"8px 12px",marginTop:8}}>
-        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:3}}><SevBadge sev={issue.severity}/><span style={{color:"#ddc",fontSize:12}}>{issue.issue}</span></div>
-        <div style={{color:"#888",fontSize:11}}>→ {issue.action}</div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:3}}><SevBadge sev={issue.severity}/><span style={{color:"#1F2937",fontSize:12}}>{issue.issue}</span></div>
+        <div style={{color:"#4B5563",fontSize:11}}>→ {issue.action}</div>
       </div>
     ))}
   </div>;
@@ -714,10 +758,10 @@ function HeadersPanel({http}) {
       </div>
     )}
     {http.issues?.map((issue,i)=>(
-      <div key={i} style={{background:"#1a1000",border:`1px solid ${SEV_COLOR[issue.severity]||"#333"}30`,
+      <div key={i} style={{background:"#FFFBEB",border:`1px solid ${SEV_COLOR[issue.severity]||"#333"}30`,
         borderLeft:`3px solid ${SEV_COLOR[issue.severity]||"#333"}`,borderRadius:6,padding:"8px 12px",marginTop:8}}>
-        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:3}}><SevBadge sev={issue.severity}/><span style={{color:"#ddc",fontSize:12}}>{issue.issue}</span></div>
-        <div style={{color:"#888",fontSize:11}}>→ {issue.action}</div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:3}}><SevBadge sev={issue.severity}/><span style={{color:"#1F2937",fontSize:12}}>{issue.issue}</span></div>
+        <div style={{color:"#4B5563",fontSize:11}}>→ {issue.action}</div>
       </div>
     ))}
   </div>;
@@ -1066,7 +1110,7 @@ function QuantumSimulator({result}) {
             ["ATTACK", "Shor's Algorithm", "#D97706"],
             ["HNDL STATUS", isVulnerable ? "⚠ EXPOSED" : "✓ PROTECTED", isVulnerable ? "#DC2626" : "#059669"],
           ].map(([k,v,c])=>(
-            <div key={k} style={{background:"#F7F8FC",border:"1px solid #1a1a1a",borderRadius:6,padding:"8px 10px"}}>
+            <div key={k} style={{background:"#F7F8FC",border:"1px solid #DDE1EE",borderRadius:6,padding:"8px 10px"}}>
               <div style={{color:"#555555",fontSize:9,letterSpacing:1,marginBottom:3}}>{k}</div>
               <div style={{color:c,fontFamily:"inherit",fontSize:11,fontWeight:700}}>{v}</div>
             </div>
@@ -1091,12 +1135,12 @@ function QuantumSimulator({result}) {
       </div>
 
       {phase !== "idle" && (
-        <div style={{background:"#F7F8FC",border:"1px solid #1a1a1a",borderRadius:10,padding:"16px",fontFamily:"inherit"}}>
+        <div style={{background:"#F7F8FC",border:"1px solid #DDE1EE",borderRadius:10,padding:"16px",fontFamily:"inherit"}}>
           <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
             <span style={{color:"#555",fontSize:11}}>SIMULATION PROGRESS</span>
             <span style={{color:riskColor,fontWeight:700,fontSize:13}}>{progress}%</span>
           </div>
-          <div style={{background:"#0a0a0a",borderRadius:3,height:4,marginBottom:14,overflow:"hidden"}}>
+          <div style={{background:"#E2E8F0",borderRadius:3,height:4,marginBottom:14,overflow:"hidden"}}>
             <div style={{height:"100%",width:`${progress}%`,background:`linear-gradient(90deg,#7c3aed,${riskColor})`,
               transition:"width 0.5s ease",borderRadius:3}}/>
           </div>
@@ -1104,13 +1148,13 @@ function QuantumSimulator({result}) {
           <div style={{maxHeight:280,overflowY:"auto"}}>
             {steps.slice(0, step).map((s, i) => (
               <div key={i} style={{display:"flex",gap:10,padding:"6px 0",
-                borderBottom:"1px solid #0f0f0f",alignItems:"flex-start"}}>
-                <span style={{color:"#333",fontSize:10,flexShrink:0,marginTop:2}}>{String(i+1).padStart(2,"0")}</span>
+                borderBottom:"1px solid #EEF0F8",alignItems:"flex-start"}}>
+                <span style={{color:"#6B7280",fontSize:10,flexShrink:0,marginTop:2}}>{String(i+1).padStart(2,"0")}</span>
                 <div>
                   <div style={{color:s.color,fontSize:11,fontWeight:700}}>{s.label}</div>
-                  <div style={{color:"#444",fontSize:10,marginTop:2}}>{s.detail}</div>
+                  <div style={{color:"#4B5563",fontSize:10,marginTop:2}}>{s.detail}</div>
                 </div>
-                <span style={{marginLeft:"auto",color:"#333",fontSize:10,flexShrink:0}}>✓</span>
+                <span style={{marginLeft:"auto",color:"#6B7280",fontSize:10,flexShrink:0}}>✓</span>
               </div>
             ))}
             {phase==="running" && step < steps.length && (
@@ -1124,7 +1168,7 @@ function QuantumSimulator({result}) {
 
           {phase === "done" && (
             <div style={{marginTop:14,padding:"14px",borderRadius:8,
-              background:isVulnerable?"#1a0000":"#061a0f",
+              background:isVulnerable?"#FEF2F2":"#ECFDF5",
               border:`1px solid ${isVulnerable?"#DC2626":"#059669"}40`}}>
               <div style={{color:isVulnerable?"#DC2626":"#059669",fontWeight:900,fontSize:16,marginBottom:6}}>
                 {isVulnerable?"🔴 ATTACK SUCCESSFUL — KEY COMPROMISED":"🟢 ATTACK FAILED — PQC ALGORITHMS HELD"}
@@ -1377,8 +1421,8 @@ function ResultCard({result,onSelect,selected}) {
   const pqc=result.pqc_assessment||{};const tls=result.tls_info||{};
   const vulnCount=result.vulnerabilities?.length||0;const c=RISK_COLOR[pqc.status]||RISK_COLOR.UNKNOWN;
   return (
-    <div onClick={()=>onSelect(result)} style={{background:selected?"#0e0e20":"#080818",
-      border:`1px solid ${selected?c.border:"#1e1e3a"}`,borderLeft:`3px solid ${c.border}`,
+    <div onClick={()=>onSelect(result)} style={{background:selected?"#F3F4F6":"#FFFFFF",
+      border:`1px solid ${selected?c.border:"#DDE1EE"}`,borderLeft:`3px solid ${c.border}`,
       borderRadius:8,padding:"12px 14px",cursor:"pointer",transition:"all 0.2s",marginBottom:8,
       boxShadow:selected?`0 0 16px ${c.glow}`:"none"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -1795,7 +1839,19 @@ export default function QuantumShield() {
   const [scanning,   setScanning]   = useState(false);
   const [selected,   setSelected]   = useState(null);
   const [progress,   setProgress]   = useState({current:0,total:0,current_target:""});
-  const [backendUrl, setBackendUrl] = useState(import.meta.env.VITE_BACKEND_URL||"http://localhost:8000");
+  const [backendUrl, setBackendUrl] = useState(() => {
+    try {
+      return localStorage.getItem("qs_backend_url") || import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+    } catch (_) {
+      return import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+    }
+  });
+  const handleBackendUrlChange = (url) => {
+    setBackendUrl(url);
+    try {
+      localStorage.setItem("qs_backend_url", url);
+    } catch (_) {}
+  };
   const [backendOk,  setBackendOk]  = useState(false);
   const [activeView, setActiveView] = useState("scanner");
   const [termLog,    setTermLog]    = useState([]);
@@ -2099,7 +2155,7 @@ export default function QuantumShield() {
       </div>
     </div>
   );
-  if(!token) return <LoginScreen backendUrl={backendUrl} onLogin={handleLogin}/>;
+  if(!token) return <LoginScreen backendUrl={backendUrl} onBackendUrlChange={handleBackendUrlChange} onLogin={handleLogin}/>;
 
   // ── Main App ───────────────────────────────────────────────────────────────
   const views=[
@@ -2130,11 +2186,11 @@ export default function QuantumShield() {
           <div style={{display:"flex",gap:2,flexWrap:"wrap",justifyContent:"flex-end"}}>
             {views.map(v=>(
               <button key={v.id} onClick={()=>setActiveView(v.id)} style={{
-                background:activeView===v.id?"linear-gradient(135deg,#1e1e3a,#16163a)":"none",
-                border:activeView===v.id?"1px solid #B8C0D8":"1px solid transparent",
-                color:activeView===v.id?"#c4b5fd":"#5a5a8a",padding:"5px 13px",borderRadius:6,cursor:"pointer",
+                background:activeView===v.id?"linear-gradient(135deg,#7c3aed,#2563eb)":"none",
+                border:"1px solid transparent",
+                color:activeView===v.id?"#ffffff":"#5a5a8a",padding:"5px 13px",borderRadius:6,cursor:"pointer",
                 fontFamily:"inherit",fontSize:11,letterSpacing:0.5,transition:"all 0.2s",whiteSpace:"nowrap",
-                boxShadow:activeView===v.id?"0 0 12px #7c3aed30":"none"}}>
+                boxShadow:activeView===v.id?"0 0 12px #7c3aed40":"none"}}>
                 {v.label}
               </button>
             ))}
@@ -2220,7 +2276,7 @@ export default function QuantumShield() {
                   width:"100%",height:110,background:"#F7F8FC",border:"1px solid #DDE1EE",
                   borderRadius:7,color:"#1A1D2E",fontFamily:"inherit",fontSize:12,
                   padding:"8px 10px",resize:"none",outline:"none",boxSizing:"border-box"}}/>
-              <input value={backendUrl} onChange={e=>setBackendUrl(e.target.value)}
+              <input value={backendUrl} onChange={e=>handleBackendUrlChange(e.target.value)}
                 style={{width:"100%",background:"#F7F8FC",border:"1px solid #DDE1EE",borderRadius:5,
                   color:"#6B7280",fontFamily:"inherit",fontSize:11,padding:"5px 8px",
                   outline:"none",marginTop:6,boxSizing:"border-box"}}/>
@@ -2305,7 +2361,7 @@ export default function QuantumShield() {
                       const pqc=r.pqc_assessment||{};const tls=r.tls_info||{};
                       const cert=r.certificate||{};const vcount=r.vulnerabilities?.length||0;
                       return (
-                        <tr key={i} onClick={()=>setSelected(r)} style={{borderBottom:"1px solid #EEF0F8",cursor:"pointer",background:selected?.target===r.target?"#0e0e22":"transparent"}}>
+                        <tr key={i} onClick={()=>setSelected(r)} style={{borderBottom:"1px solid #EEF0F8",cursor:"pointer",background:selected?.target===r.target?"#EEF2FF":"transparent"}}>
                           <td style={{padding:"9px 10px",color:"#1B3FAB",fontFamily:"inherit",fontSize:11}}>{r.target}</td>
                           <td style={{padding:"9px 10px",color:tls.tls_version?.includes("1.3")?"#059669":"#D97706",whiteSpace:"nowrap"}}>{tls.tls_version||"—"}</td>
                           <td style={{padding:"9px 10px",color:"#6B7280",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tls.cipher_suite||"—"}</td>
@@ -2413,13 +2469,13 @@ export default function QuantumShield() {
           <div style={{maxWidth:900,margin:"0 auto"}}>
             {/* Hero */}
             <div style={{textAlign:"center",marginBottom:48,padding:"48px 32px",
-              background:"linear-gradient(135deg,#0a0a1e,#12082a)",
-              border:"1px solid #2a1a4a",borderRadius:16,
+              background:"linear-gradient(135deg,#F5F3FF,#EEF2FF)",
+              border:"1px solid #DDE1EE",borderRadius:16,
               boxShadow:"0 0 60px #7c3aed15"}}>
-              <div style={{fontSize:64,marginBottom:16,filter:"drop-shadow(0 0 20px #7c3aed60)"}}>⚛</div>
+              <div style={{fontSize:64,marginBottom:16,filter:"drop-shadow(0 0 20px #7c3aed20)"}}>⚛</div>
               <div style={{color:"#1A1D2E",fontWeight:900,fontSize:28,letterSpacing:4,marginBottom:6}}>QUANTUMSHIELD</div>
               <div style={{color:"#7C3AED",fontWeight:700,fontSize:14,letterSpacing:3,marginBottom:4}}>POST-QUANTUM CRYPTOGRAPHY SCANNER</div>
-              <div style={{color:"#9CA3AF",fontSize:12,marginBottom:16}}>NIST FIPS 203/204/205 · Active ML-KEM key-exchange detection</div>
+              <div style={{color:"#4B5563",fontSize:12,marginBottom:16}}>NIST FIPS 203/204/205 · Active ML-KEM key-exchange detection</div>
               <div style={{display:"flex",justifyContent:"center",gap:8,flexWrap:"wrap"}}>
                 {[["FIPS 203","ML-KEM","#60a5fa"],["FIPS 204","ML-DSA","#34d399"],["FIPS 205","SLH-DSA","#a78bfa"],
                   ["Active","KEX Probe","#D97706"],["CycloneDX","v1.4 CBOM","#f472b6"]].map(([s,n,c])=>(
@@ -2437,7 +2493,7 @@ export default function QuantumShield() {
               <div style={{color:"#DC2626",fontWeight:800,fontSize:14,marginBottom:6}}>
                 🚨 Why this matters
               </div>
-              <div style={{color:"#cc8888",fontSize:12,lineHeight:1.7}}>
+              <div style={{color:"#7F1D1D",fontSize:12,lineHeight:1.7}}>
                 Most of the public internet still relies on RSA and ECDSA, which Shor's algorithm
                 breaks on a sufficiently large quantum computer. Even sites that have deployed
                 hybrid ML-KEM key exchange usually still present classical certificates — so
@@ -2467,7 +2523,7 @@ export default function QuantumShield() {
                   <div style={{fontSize:22,flexShrink:0}}>{icon}</div>
                   <div>
                     <div style={{color:"#1A1D2E",fontWeight:700,fontSize:12,marginBottom:4}}>{title}</div>
-                    <div style={{color:"#9CA3AF",fontSize:11,lineHeight:1.6}}>{desc}</div>
+                    <div style={{color:"#4B5563",fontSize:11,lineHeight:1.6}}>{desc}</div>
                   </div>
                 </div>
               ))}

@@ -142,7 +142,7 @@ app.include_router(ai_router.router,           tags=["AI"])
 app.include_router(api_scanner_router.router,  tags=["API Scanner"])
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"service": "QuantumShield PQC Scanner", "version": __version__,
             "status": "operational", "docs": "/docs"}
